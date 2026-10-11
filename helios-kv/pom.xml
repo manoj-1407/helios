@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>dev.helios</groupId>
+    <artifactId>helios-kv</artifactId>
+    <version>0.3.0-week3</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <!--
+        No dependencies on purpose. MurmurHash3 is hand-implemented
+        (dev.helios.bloom.MurmurHash3) rather than pulled in from Guava,
+        and everything else (WAL framing, SSTable format, sparse index,
+        compaction merge, the test suite) is plain java.nio and java.util.
+        Real JUnit would have been preferable for src/test, but this
+        sandbox's network egress allowlist doesn't include Maven Central,
+        so org.junit:* couldn't actually be resolved here — see README's
+        "Test suite" section.
+    -->
+
+    <build>
+        <finalName>helios-kv</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>dev.helios.Main</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

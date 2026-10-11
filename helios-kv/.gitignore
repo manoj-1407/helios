@@ -1,0 +1,12 @@
+target/
+out/
+*.class
+.idea/
+*.iml
+/data/
+/tmp-data/
+*.log
+sources-main.txt
+sources-test.txt
+sources.txt
+out-test/
