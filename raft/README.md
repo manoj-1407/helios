@@ -1,168 +1,224 @@
-# helios-raft
+# raft — Consensus Layer
 
-A Raft consensus engine in Go, built against `helios-raft-spec.md`'s
-design. This README reflects what's actually built and passing right
-now — Week 1 (single-node election) and Week 2 (3-node clusters,
-replication, partition/crash recovery) are complete. Membership changes,
-snapshots, and the gRPC bridge to helios-kv are Week 3 scope and are not
-implemented (their RPC structs exist as stubs so the code compiles
-against the eventual interface; `TakeSnapshot`/`HandleInstallSnapshot`
-return explicit "not implemented" errors rather than silently no-opping).
+This package implements the Raft consensus algorithm from scratch in Go. It is the component that makes Helios a *distributed* system — without consensus, multiple nodes would have no way to agree on the same sequence of writes.
 
-## Status
+---
 
-- [x] **Week 1** — PersistentState, RaftLog, RPC structs, pre-vote, single-node election
-- [x] **Week 2** — in-process channel transport, 3-node elections, heartbeats, log replication, fast conflict resolution, network partition simulation, node crash/recover
-- [ ] **Week 3** — joint-consensus membership changes, real snapshotting, the gRPC bridge to helios-kv, the actual thesis benchmark (`RunReplicationBench`)
+## Contents
 
-18/18 tests passing, including under `go test -race` (450 normal-mode
-test executions + 225 race-mode executions, run repeatedly during
-development specifically to chase down intermittent failures — see
-below — with zero remaining failures or detected data races at time of
-writing).
+1. [What Raft does and why it exists](#what-raft-does-and-why-it-exists)
+2. [The Raft guarantee](#the-raft-guarantee)
+3. [Leader election](#leader-election)
+4. [Pre-vote extension](#pre-vote-extension)
+5. [Log replication](#log-replication)
+6. [Commit and apply](#commit-and-apply)
+7. [Snapshots](#snapshots)
+8. [Replication metrics](#replication-metrics)
+9. [Compaction coordinator](#compaction-coordinator)
+10. [File map](#file-map)
+11. [Running tests](#running-tests)
 
-## Architecture
+---
+
+## What Raft does and why it exists
+
+Imagine three servers, each storing the same key-value data. A client writes `SET foo bar` to server 1. Servers 2 and 3 also need to have `foo = bar`. What if server 1 crashes after writing locally but before telling the others? What if the network drops the message to server 3 but not server 2? What if servers 2 and 3 simultaneously decide server 1 is dead and both try to become the new primary — do you get two primaries writing conflicting data?
+
+These are the problems consensus solves. Raft provides a **single agreed-upon sequence** of operations that all nodes apply in the same order. If a majority of nodes received an operation, it is **committed** — it will never be lost even if every other node crashes.
+
+---
+
+## The Raft guarantee
+
+**Safety:** at any point in time, there is at most one leader per term. Two leaders can never exist simultaneously. A committed entry will appear in the log of every future leader.
+
+**Liveness:** as long as a majority of nodes can communicate with each other, the cluster will elect a leader and make progress.
+
+**What Raft does NOT guarantee:** liveness in the face of a majority failure. If 2 out of 3 nodes crash, the remaining node cannot form a quorum and will not accept writes. This is correct behavior — it is better to refuse writes than to accept them and potentially diverge from the crashed nodes.
+
+---
+
+## Leader election
+
+Each node runs an **election timer** — a random timeout between 150ms and 300ms. When the timer fires without hearing from a leader, the node becomes a **candidate** and starts an election.
+
+**Why random timeouts?** If all nodes had the same timeout, they would all start elections simultaneously and all fail (split votes). Randomization ensures one node usually fires first and wins before others wake up.
+
+Election steps:
+1. Node increments its current term
+2. Node votes for itself
+3. Node sends `RequestVote` RPCs to all peers
+4. If it receives votes from a majority (including itself): it becomes leader, starts sending heartbeats
+5. If it receives a `RequestVote` or `AppendEntries` from a node with a higher term: it reverts to follower
+
+**Vote grant rules:**  
+A node grants its vote if:
+- The candidate's term is at least as large as the voter's current term
+- The voter has not already voted in this term
+- The candidate's log is at least as up-to-date as the voter's log (last log term comparison, then index comparison)
+
+The log up-to-date check prevents a lagging node with old data from becoming leader.
+
+---
+
+## Pre-vote extension
+
+Standard Raft has a problem with partitioned nodes. If node3 gets network-isolated, it:
+1. Times out waiting for heartbeats
+2. Increments its term to, say, term 10
+3. Tries to hold an election — fails because it can't reach anyone
+4. Increments term to 11, tries again... keeps incrementing
+
+When node3 rejoins, it sends a `RequestVote` for term 47. The current stable leader (at term 6) receives this message, sees the higher term, and **steps down** — even though node3 is completely behind on the log. The cluster now has no leader and must hold another election. This causes unnecessary disruption.
+
+**Pre-vote** (`prevote.go`) adds a phase before incrementing the term:
+
+1. Node sends `PreVote` RPCs asking peers: "if I started an election right now, would you vote for me?"
+2. If a majority responds "yes": *then* increment term and start the real election
+3. If not: don't increment term, stay as follower
+
+Partitioned nodes can never get pre-votes (they can't reach anyone), so their term never increases. When they rejoin, they have a normal term and rejoin as followers without disruption.
+
+This is the same extension etcd uses.
+
+---
+
+## Log replication
+
+After election, the leader:
+1. Begins sending periodic **heartbeats** (empty `AppendEntries`) to all followers to reset their election timers
+2. When it receives a write, appends it to its own log
+3. Sends `AppendEntries` to all followers in parallel
+4. Once a majority (including itself) have written the entry to their log: **commits** it
+5. Notifies the state machine to apply the committed entry
+6. On the next AppendEntries (or heartbeat): tells followers the new commit index, so they also apply it
+
+**Log matching invariant:** if two logs have an entry with the same index and term, all entries before that index are identical. Raft enforces this by including `prevLogIndex` and `prevLogTerm` in every AppendEntries. A follower rejects the message if its log doesn't match at that position — the leader then backs up and resends from the divergence point.
+
+**Fast conflict resolution:** when a follower rejects AppendEntries, it can include the conflicting term in its response. The leader then jumps directly to the start of that term's entries rather than backing up one entry at a time. This reduces the catch-up time from O(n) round trips to O(terms).
+
+---
+
+## Commit and apply
+
+`statemachine.go`
+
+The distinction between **committed** and **applied** is important:
+
+- **Committed** means a majority of nodes have the entry in their log. It will not be lost. But it hasn't been executed yet.
+- **Applied** means the entry has been executed — the actual KV put/get/delete has happened.
+
+The apply loop runs in a dedicated goroutine. It watches `commitIndex` and applies entries from `lastApplied + 1` to `commitIndex` in order. Each entry is sent to the bridge as an HTTP call to helios-kv.
+
+The log records the P99 latency of apply operations as part of `ReplicationMetrics`. Slow apply = followers fall behind = higher pressure.
+
+---
+
+## Snapshots
+
+`snapshot.go`
+
+The Raft log grows indefinitely. Without compaction, a restarting node would need to replay millions of log entries. **Snapshots** solve this: the state machine periodically writes the entire current state to a snapshot file, and the Raft log is truncated up to that point.
+
+When a new node joins or a lagging follower is too far behind for log replication to catch up, the leader sends the snapshot directly. The follower discards its log, installs the snapshot, and resumes from there.
+
+The snapshot infrastructure is implemented (`snapshot.go`) but the install-snapshot RPC is not yet wired into the bridge for full cross-node state transfer. This is listed as a future work item.
+
+---
+
+## Replication metrics
+
+`metrics.go`
+
+`ReplicationMetrics` tracks the health of replication in real time. It is the data source for the pressure feedback loop.
+
+```go
+type ReplicationMetrics struct {
+    mu          sync.RWMutex
+    lagPerPeer  map[string]int64     // leaderLastIndex - matchIndex per peer
+    applyTimes  []time.Duration      // last 100 apply latencies (ring buffer)
+    lastAck     map[string]time.Time // when did we last hear from each peer
+}
+```
+
+**`PressureLevel() float64`** — the core output:
 
 ```
-raft/
-  state.go        PersistentState (term, votedFor) with atomic fsync'd persistence
-  log.go          RaftLog: append-only WAL-style file, byte-offset tracked for
-                  physical (not just in-memory) truncation, crash-tolerant replay
-  rpc.go          AppendEntries / RequestVote structs
-  prevote.go      Pre-vote phase + PreVoteRequest/Response
-  transport.go    Transport interface; ChannelTransport (in-process, for tests)
-  statemachine.go StateMachine interface; MockStateMachine (for tests --
-                  the real implementation is the eventual helios-kv bridge)
-  snapshot.go     RPC structs only; TakeSnapshot/HandleInstallSnapshot
-                  return explicit not-implemented errors (Week 3)
-  raft.go         RaftNode: election, heartbeats, replication, commit
-                  advancement, the applier goroutine
+pressure = 0.4 × min(maxLag / 100, 1.0)
+         + 0.4 × min(p99ApplyLatency / 500ms, 1.0)
+         + 0.2 × min(maxStaleness / 2s, 1.0)
 
-chaos/
-  network.go      SimulatedNetwork: partition / delay / drop-rate fault injection
-  harness.go      Cluster: spins up N in-process RaftNodes over a shared
-                  ChannelTransport for fast, deterministic multi-node tests
+clamped to [0.0, 1.0]
 ```
 
-### Why one file per SSTable in helios-kv, and the equivalent decision here
+Why these weights?
+- Lag (0.4): the most direct measure of replication health. If followers are 200 entries behind, that's a serious problem.
+- Apply latency (0.4): high apply latency means the storage engine is overloaded — probably because of compaction I/O competing with write operations.
+- Staleness (0.2): a soft signal. If we haven't heard from a follower in 2 seconds but everything else is fine, it's a warning but not yet critical.
 
-The Raft log is one append-only file with byte offsets tracked
-in-memory (`offsets[i]` = where entry `i` starts), so `TruncateFrom`
-can call the OS `Truncate` syscall directly at the right byte instead of
-rewriting the file. Same reasoning as helios-kv's WAL: a torn trailing
-record at the tail is the expected shape of an interrupted write, not a
-bug, so `replay()` stops there silently instead of throwing — the same
-pattern, in the same words, because it's the same problem in a different
-language.
+**`ShouldReduceIOPressure() bool`** — returns true when `PressureLevel() > 0.6`. Used by the coordinator.
 
-### Locking discipline
+**`MaxFollowerLag() int64`** — returns the maximum lag across all followers. Displayed on the dashboard.
 
-Every mutable `RaftNode` field is protected by one mutex (`r.mu`).
-Methods named with a `Locked` suffix (`becomeFollowerLocked`,
-`resetElectionTimerLocked`, `maybeAdvanceCommitIndexLocked`,
-`lastIndexForTermLocked`, `findConflictLocked`) assume the caller already
-holds `r.mu` and never acquire or release it themselves — that's what
-makes them safely callable from inside another already-locked method
-without a self-deadlock. The one rule that has to hold everywhere else:
-never call out through `Transport` while holding `r.mu`. Every RPC,
-sent or received, releases the lock first. That's what stops two nodes
-calling into each other synchronously while each holds its own lock from
-deadlocking against each other.
+**`UpdateLag(peer, leaderLastIndex, matchIndex)`** — called by the replication loop after each successful AppendEntries. Updates lag for that peer.
 
-## Real bugs found during development (not hypothetical)
+---
 
-Three of these were caught by writing tests and then running them
-*hundreds* of times under load, not by reading the code:
+## Compaction coordinator
 
-### 1. Stale pre-vote term-stacking (raft.go, `runElection`)
+`compaction_signal.go`
 
-Pre-vote is a blocking, network-RPC-bound phase that can take up to an
-RPC timeout to resolve. The original code read `CurrentTerm` once at the
-very start, ran the blocking pre-vote round, and then *unconditionally*
-did `CurrentTerm++` once it returned — without checking whether anything
-had changed `CurrentTerm` while it was waiting.
+The coordinator prevents simultaneous compaction across the cluster without using consensus.
 
-It can, and did: under a 3-node startup race (two nodes' election timers
-firing close together), node A could legitimately grant a real vote to
-node B *while A's own pre-vote round was still in flight*. When A's
-pre-vote then returned, A proceeded to increment its *already-bumped*
-term again and become a candidate — silently discarding the vote it had
-just legitimately cast, and stacking a spurious second election on top
-of a cluster that had already converged. Traced with sequence-numbered
-debug logging across concurrent goroutines until the exact interleaving
-was visible; fixed by snapshotting the term before pre-vote and
-verifying it's unchanged afterward, abandoning the attempt if not.
+```go
+type CompactionCoordinator struct {
+    mu             sync.Mutex
+    lastCompaction map[string]time.Time  // nodeID → last compaction start
+    staggerWindow  time.Duration         // default 2s
+}
+```
 
-### 2. Missing election timer on a specific step-down path (raft.go, `becomeFollowerLocked`)
+**`RecordCompactionStart(nodeID)`** — called when a node begins a compaction cycle. Gossiped to other nodes via the bridge heartbeat (soft, best-effort).
 
-A candidate that saw a higher term in a vote *response* (not a request)
-stepped down to Follower correctly, but that specific call site never
-re-armed the election timer. A node that's a Follower with no live timer
-can never detect a future leader failure on its own — a real liveness
-bug, not a safety one, but still a node that could get permanently stuck
-relying on someone else's heartbeats forever. Fixed by moving the timer
-reset into `becomeFollowerLocked` itself (always arms a fresh timer on
-every transition to Follower) instead of leaving it to individual call
-sites, which is what let one get missed in the first place.
+**`ShouldDefer(nodeID) bool`** — returns true if another node compacted within the stagger window. If true, the calling node delays its compaction by `DeferDuration(nodeID)`.
 
-### 3. Unsynchronized field exposed on the test-only MockStateMachine
+**Why no consensus for this?**  
+Because compaction timing is a performance optimization, not a correctness requirement. If two nodes compact simultaneously, performance degrades (I/O contention, higher replication lag) but the cluster remains correct. Using Raft consensus to coordinate compaction would add write latency to every compaction decision, which is counterproductive. Best-effort gossip is sufficient.
 
-`go test -race` caught a genuine data race: `MockStateMachine.Apply()`
-correctly mutated its applied-entries list under its own mutex, but the
-field was exported directly, and a test polled it with no synchronization
-at all. Fixed by making the field private and adding `AppliedCount()` /
-`AppliedEntries()` accessors that copy under lock. Small, but exactly the
-shape of bug `-race` exists to catch — it would never reliably show up as
-a test failure, only as genuinely undefined behavior under the right
-(or wrong) scheduling.
+---
 
-### 4. (Test-only) An artificial fault-injection test had its own race
+## File map
 
-`TestFastConflictResolution` injects fake high-term log entries directly
-into a follower's log file to simulate divergence, bypassing the timer
-reset a real AppendEntries would have triggered. In a rare timing window,
-the follower's own *pre-existing* election timer could fire before the
-leader's corrective heartbeat arrived, and the follower could win a real
-election on the strength of a term nobody actually voted it into. Not a
-protocol bug — a log entry's term is *supposed* to look authoritative;
-the only reason this could happen is that the test fabricated entries
-directly instead of simulating a real prior election. Fixed by resetting
-the follower's timer immediately after injection, which is white-box
-test code reaching into the package directly (same module, intentional).
+| File | Purpose |
+|------|---------|
+| `raft.go` | `RaftNode` struct, constructor, main loop |
+| `state.go` | Role enum (leader/follower/candidate), term/vote persistence |
+| `log.go` | Log storage, append, truncate, access by index |
+| `rpc.go` | `AppendEntries`, `RequestVote` RPC types and HTTP handler |
+| `transport.go` | HTTP client for sending RPCs to peers |
+| `prevote.go` | Pre-vote phase implementation |
+| `statemachine.go` | Apply loop, state machine interface |
+| `snapshot.go` | Snapshot creation and install infrastructure |
+| `metrics.go` | `ReplicationMetrics`, `PressureLevel()` |
+| `compaction_signal.go` | `CompactionCoordinator` |
+| `election_test.go` | Leader election, re-election after crash |
+| `replication_test.go` | Log replication, fast conflict resolution |
+| `log_test.go` | Log append, truncate, index access |
+| `state_test.go` | Term/vote persistence across restarts |
+| `testhelpers_test.go` | In-process cluster setup for tests |
 
-## Known limitations
+---
 
-- **No membership changes.** Joint consensus (`membership.go`) isn't
-  built. Cluster size is fixed at construction time.
-- **No real snapshotting.** `TakeSnapshot`/`HandleInstallSnapshot` return
-  explicit errors. This isn't a problem yet only because nothing
-  truncates the log either — once compaction-driven log truncation is
-  added, a follower that falls far enough behind to need entries that
-  have already been truncated away will have nowhere to catch up from
-  except a snapshot that doesn't exist yet.
-- **No gRPC transport.** Only the in-process `ChannelTransport` exists.
-  Real cross-process Raft needs an actual network transport
-  implementing the same `Transport` interface — that's specifically
-  designed to be a drop-in swap, not a rewrite, but it hasn't been
-  written.
-- **No bridge to helios-kv.** `StateMachine` is implemented only by
-  `MockStateMachine` (an in-memory map for tests). The real
-  implementation — a gRPC sidecar into the actual Java process — is
-  Week 3 scope.
-- **Timing-sensitive tests use compressed timeouts for speed**, which
-  showed measurable (if low, ~1-5%) flakiness under `go test -race`'s
-  instrumentation overhead specifically, fixed by widening the test
-  margin. This is a property of testing real wall-clock timers fast,
-  not a correctness gap — but it's listed here rather than glossed over.
+## Running tests
 
-## What's next
+```bash
+cd helios-bridge  # or wherever go.mod is
+go test ./raft/... -v -timeout 30s
+```
 
-The actual thesis — "adaptive compaction in helios-kv reduces
-replication lag divergence compared to static leveled compaction" —
-needs, in order: the gRPC bridge (`store/bridge.go`), `BridgeMetrics`
-(the instrument that actually measures apply latency against compaction
-events), and `RunReplicationBench`'s three-config comparison (adaptive
-both / mismatched / static leveled both). None of that can produce a
-real number until the bridge exists. Building it is the next concrete
-step, not the eBPF layer — eBPF measures the interaction once the
-interaction exists to measure; it can't substitute for the bridge.
+The tests spin up in-process Raft clusters with simulated network (channels instead of HTTP) for determinism and speed. Key test scenarios:
+
+- **Election:** single node becomes leader, three-node cluster elects leader, re-election after leader crash
+- **Replication:** leader replicates to followers, follower with gap catches up, fast conflict resolution
+- **Persistence:** node restarts and recovers its term/vote, log entries survive restart
+- **Chaos:** `cluster_test.go` in `chaos/` runs a real multi-process cluster with network partition injection

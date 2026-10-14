@@ -1,32 +1,104 @@
-# helios-ebpf
+# ebpf — Kernel I/O Tracer
 
-Kernel-level observability for the helios distributed KV store. Attaches
-kprobes to `sys_write` and `sys_fsync` on helios-kv JVM processes and
-helios-raft Go processes, correlates syscall latency spikes with compaction
-events from the bridge layer, and exports the result as Prometheus metrics.
-
-This is what turns "we measured apply latency in Go" into "we proved the
-mechanism at the kernel level" — the compaction event timestamp comes from
-the application layer (helios-kv's `/stats` endpoint), and the I/O latency
-spike timestamp comes from the kernel (kretprobe fires on `sys_fsync`
-return). When those two timestamps are within 500ms of each other, the
-correlation is kernel-verified, not inferred.
+The eBPF tracer attaches kernel probes to the `sys_write` and `sys_fsync` system calls for any process in the Helios cluster. It lets you correlate application-level events (compaction cycles, pressure changes) with kernel-level I/O metrics (bytes flushed, fsync latency) without modifying the application.
 
 ---
 
-## Prerequisites
+## Why eBPF?
 
-Your kernel must have:
+Application-level metrics tell you what the application *thinks* it's doing. `"Compaction wrote 100MB"` tells you the application submitted 100MB of writes. It does not tell you:
+- How long those writes actually took to hit persistent storage
+- Whether `fsync` blocked for 800ms while the kernel flushed the page cache
+- What fraction of time the disk was busy
+- Whether the JVM's GC paused mid-compaction and caused a latency spike
+
+eBPF observes these things at the kernel level, for every write and fsync, with sub-microsecond overhead and zero changes to the application code.
+
+**eBPF** (extended Berkeley Packet Filter) is a Linux kernel feature that lets you load verified programs into the kernel. These programs run in response to kernel events (a syscall being called, a function being entered, a network packet arriving) and can record data into ring buffers that userspace reads. The kernel verifier checks the program before loading — it cannot crash the kernel, cannot loop infinitely, cannot access arbitrary memory.
+
+---
+
+## What it traces
+
+### `sys_write` kprobe
+
+Fires on every `write()` system call. Records:
+- Process ID
+- File descriptor
+- Bytes written
+- Timestamp (nanoseconds)
+
+### `sys_fsync` kprobe + kretprobe
+
+The kprobe fires when `fsync()` is entered. The kretprobe fires when it returns. The difference is fsync duration — how long the kernel held the write until it hit persistent storage.
+
+Records:
+- Process ID
+- File descriptor
+- fsync duration (nanoseconds)
+- Return code
+
+---
+
+## What the userspace correlator does
+
+`userspace/correlator.go`
+
+Reads events from the eBPF ring buffer. For each event, it:
+1. Looks up the process name — events are filtered to Helios processes only (processes named `helios` or with `helios-kv` in their command line)
+2. Tags the event with a node ID (derived from the data directory path or port)
+3. Feeds the event into the exporter
+
+`userspace/exporter.go`
+
+Aggregates events into:
+- **Bytes written per second** (rolling 1s window per node)
+- **fsync latency P50/P95/P99** (rolling 100-event window per node)
+- **Write throughput (ops/sec)**
+
+Exports as:
+- Structured JSON log lines to stdout
+- Prometheus metrics on `:9090/metrics` (optional, enable with `-metrics`)
+
+---
+
+## Correlation with application events
+
+By running the eBPF tracer alongside the cluster, you can answer questions like:
+
+**"Did replication pressure actually reduce compaction I/O?"**
+- Watch `bytes_written_per_sec` for a follower node
+- Trigger a load spike on the leader
+- Observe pressure rising in the dashboard
+- Observe `bytes_written_per_sec` dropping as compaction is suppressed
+
+**"What is the actual fsync latency on this machine?"**
+- `fsync_p99_ns` gives the real number, including OS buffering and disk scheduler latency
+- Application-reported latency is often lower because it measures the time to submit the write, not the time to flush it
+
+**"Is compaction causing write stalls?"**
+- A spike in `fsync_p99_ns` during a compaction cycle confirms that the disk is saturated
+- Cross-reference with Raft apply latency (from `ReplicationMetrics`) to see if it's causing follower lag
+
+---
+
+## Build requirements
+
+- Linux kernel 5.8+ (required for eBPF ring buffers)
+- clang 18+
+- libbpf-dev
+- `bpf_helpers.h` (from libbpf-dev or kernel headers)
+
+Check your environment:
 ```bash
-zcat /proc/config.gz | grep -E "CONFIG_KPROBES|CONFIG_BPF_SYSCALL|CONFIG_DEBUG_INFO_BTF"
-# All three should show =y
+clang --version     # need 18+
+ls /usr/include/bpf/bpf_helpers.h  # must exist
+uname -r            # need 5.8+
 ```
 
-Verified working on: WSL2 kernel 6.6.87.2-microsoft-standard-WSL2.
-
-Install the toolchain once:
+On Ubuntu/Debian:
 ```bash
-sudo apt-get install -y clang llvm libbpf-dev linux-tools-generic
+sudo apt install clang-18 libbpf-dev linux-headers-$(uname -r)
 ```
 
 ---
@@ -35,120 +107,64 @@ sudo apt-get install -y clang llvm libbpf-dev linux-tools-generic
 
 ```bash
 cd ebpf
-
-# Step 1: compile the kernel-side BPF C program
-make kernel
-# This generates:
-#   kernel/vmlinux.h          (kernel type definitions via BTF)
-#   kernel/helios_trace.bpf.o (ELF BPF object loaded into the kernel)
-
-# Step 2: build the Go userspace binary
-make userspace
-# Produces: ./helios-ebpf
+./build.sh
 ```
+
+The build script:
+1. Compiles `kernel/helios_trace.bpf.c` with clang to BPF bytecode
+2. Generates Go bindings with `bpf2go`
+3. Builds the userspace loader + correlator + exporter as a Go binary
+
+Output: `ebpf/helios-ebpf`
 
 ---
 
-## Run
-
-**Start the helios benchmark first**, then in a second terminal:
+## Running
 
 ```bash
-# Auto-detect PIDs and start tracing
-make run
+# must be run as root or with CAP_BPF capability
+sudo ./ebpf/helios-ebpf -pids $(pgrep -d, -f helios)
 
-# Or manually:
-sudo ./helios-ebpf \
-  -pids $(pgrep -f "helios-kv.jar" | tr '\n' ',' | sed 's/,$//') \
-  -v
+# with Prometheus metrics
+sudo ./ebpf/helios-ebpf -pids $(pgrep -d, -f helios) -metrics :9090
 ```
 
-`-v` prints each interesting event to stdout as it arrives.
-
-Metrics are served at `http://localhost:9090/metrics`:
-```bash
-curl http://localhost:9090/metrics
-```
-
----
-
-## What gets traced
-
-### kprobes attached:
-- `__x64_sys_write` — every write(2) syscall from tracked PIDs
-- `__x64_sys_fsync` — every fsync(2) syscall from tracked PIDs
-
-`fsync` is the more important one for the thesis: it's what makes WAL
-appends and SSTable flushes durable. When compaction fires and the JVM
-starts merging SSTables, the disk I/O pressure shows up as elevated
-`sys_fsync` latency. The kretprobe captures the exact return time, so
-`duration_ns = return_time - entry_time` is the real kernel-measured
-duration, not an application estimate.
-
-### PID filtering:
-The filter happens in the kernel BPF program, not in userspace. For every
-`sys_write`/`sys_fsync`, the BPF program does one hash map lookup. If
-the calling PID is not in the filter, it takes the early return (~30ns
-overhead). If it is, it records the timestamp. This is why the advertised
-overhead is sub-1%: the common path (not a tracked PID) is a single map
-lookup plus a branch.
-
----
-
-## Metrics
-
-| metric | meaning |
-|---|---|
-| `helios_ebpf_fsync_duration_mean_ns` | Mean fsync latency (interesting events) |
-| `helios_ebpf_fsync_duration_max_ns` | Max fsync latency — where compaction spikes are visible |
-| `helios_ebpf_post_compaction_events_total` | Syscalls captured in 500ms post-compaction window |
-| `helios_ebpf_post_compaction_duration_mean_ns` | Mean latency in post-compaction window |
-| `helios_ebpf_latency_spikes_total` | Events where duration > 3x rolling P50 baseline |
-
-The metric that directly tests the thesis: compare
-`helios_ebpf_post_compaction_duration_mean_ns` across the three configs
-(adaptive_both / mismatched / static_leveled). A higher post-compaction
-mean in the mismatched config, measured at the kernel level, is the
-strongest possible form of the thesis claim.
-
----
-
-## Architecture
-
-```
-kernel space:
-  kprobe(__x64_sys_write)  → record entry timestamp in entry_times map
-  kretprobe(__x64_sys_write) → compute duration, write TraceEvent to ring buffer
-  kprobe(__x64_sys_fsync)  → same
-  kretprobe(__x64_sys_fsync) → same
-
-  ring buffer (BPF_MAP_TYPE_RINGBUF, 256KB)
-       ↓
-userspace (Go):
-  Loader.drain() reads TraceEvents from ring buffer
-       ↓
-  Correlator.Process() joins against CompactionEvents from bridge layer
-       ↓  (only "interesting" events: post-compaction OR latency spike)
-  Exporter.Record() updates Prometheus counters
-       ↓
-  http://localhost:9090/metrics
+Sample output:
+```json
+{"ts":"2026-10-05T21:30:01Z","node":"node1","event":"write","fd":7,"bytes":4096,"ns":1234567}
+{"ts":"2026-10-05T21:30:01Z","node":"node1","event":"fsync","fd":7,"duration_ns":823000,"rc":0}
+{"ts":"2026-10-05T21:30:02Z","node":"node1","metric":"write_bytes_per_sec","value":52428800}
+{"ts":"2026-10-05T21:30:02Z","node":"node1","metric":"fsync_p99_ns","value":1100000}
 ```
 
 ---
 
-## Known limitations
+## Kubernetes / containerized environments
 
-- **Requires root** (`sudo`) to load BPF programs. On kernels ≥ 5.8 with
-  `CAP_BPF`, non-root is possible but requires extra capability setup.
-- **`write_amplification` in the bridge still shows 0.0000x** — the bridge
-  polls `/stats` between apply windows, and compaction completes between
-  polls at this workload scale. The I/O pressure is real (it shows in
-  fsync latency) but the write-amp counter misses it at this granularity.
-  eBPF's fsync duration is the ground truth.
-- **Single-machine limitation still applies.** All processes share the
-  same disk. Real network-hop replication lag requires separate machines.
-- **CompactionEvent injection is manual** in this version. In a full
-  integration, `BridgeMetrics.RecordCompaction()` would call
-  `Correlator.RecordCompaction()` directly; here they're separate binaries
-  connected only through the time axis.
-EOF
+eBPF in containers requires:
+- The container must run privileged, or have `CAP_BPF` + `CAP_SYS_ADMIN`
+- The host kernel version applies (not the container's)
+- Run as a DaemonSet sidecar alongside Helios pods
+
+Example Kubernetes DaemonSet snippet:
+```yaml
+securityContext:
+  capabilities:
+    add: ["BPF", "SYS_ADMIN", "NET_ADMIN"]
+  privileged: true
+```
+
+---
+
+## File map
+
+| File | Purpose |
+|------|---------|
+| `kernel/helios_trace.bpf.c` | BPF program loaded into kernel |
+| `userspace/loader.go` | Loads the BPF program, attaches kprobes |
+| `userspace/types.go` | Event struct definitions (must match BPF C structs) |
+| `userspace/correlator.go` | Reads ring buffer, filters, tags events |
+| `userspace/exporter.go` | Aggregates and outputs metrics |
+| `cmd/helios-ebpf/main.go` | Entry point, flag parsing |
+| `build.sh` | Build script |
+| `Makefile` | Alternative make-based build |
