@@ -23,16 +23,21 @@ import (
 // have connection pooling, pipelining, and retry logic built in. Supporting
 // the redis wire protocol means helios gets all of that for free.
 type RESPServer struct {
-	helios *Client
-	addr   string
+	helios    *Client
+	addr      string
+	authToken string // empty = auth disabled
 }
 
 func NewRESPServer(heliosAddrs []string, listenAddr string) (*RESPServer, error) {
+	return NewRESPServerWithAuth(heliosAddrs, listenAddr, "")
+}
+
+func NewRESPServerWithAuth(heliosAddrs []string, listenAddr, authToken string) (*RESPServer, error) {
 	c, err := New(heliosAddrs)
 	if err != nil {
 		return nil, err
 	}
-	return &RESPServer{helios: c, addr: listenAddr}, nil
+	return &RESPServer{helios: c, addr: listenAddr, authToken: authToken}, nil
 }
 
 // Serve starts the RESP TCP server. Blocks until the listener errors.
@@ -57,12 +62,49 @@ func (s *RESPServer) handleConn(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 
+	// per-connection auth state: if a token is configured the client must
+	// send AUTH <token> before any other command, or every command returns
+	// NOAUTH. AUTH itself always succeeds/fails immediately regardless.
+	authed := s.authToken == "" // pre-authed when auth is disabled
+
 	for {
 		conn.SetDeadline(time.Now().Add(60 * time.Second))
 		cmd, args, err := readCommand(r)
 		if err != nil {
 			return
 		}
+		upper := strings.ToUpper(cmd)
+
+		// AUTH is always handled here, before the auth gate.
+		if upper == "AUTH" {
+			if len(args) < 1 {
+				writeError(w, "ERR wrong number of arguments for AUTH")
+				w.Flush()
+				continue
+			}
+			if s.authToken == "" {
+				// auth disabled — Redis convention is to return OK and ignore
+				writeSimple(w, "OK")
+				w.Flush()
+				continue
+			}
+			if args[0] == s.authToken {
+				authed = true
+				writeSimple(w, "OK")
+			} else {
+				authed = false
+				writeError(w, "WRONGPASS invalid password")
+			}
+			w.Flush()
+			continue
+		}
+
+		if !authed {
+			writeError(w, "NOAUTH authentication required")
+			w.Flush()
+			continue
+		}
+
 		s.dispatch(cmd, args, w)
 		w.Flush()
 	}

@@ -10,32 +10,42 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.zip.CRC32;
 
 /**
  * Flushes a sorted MemTable snapshot to a single .sst file on disk.
  *
- * Why one file instead of three (.sst/.idx/.bloom as separate files): a
- * compaction or a crash that deletes/renames files non-atomically is a much
- * scarier failure mode when "this SSTable" is actually three files that can
- * independently go missing or get out of sync. A single file with a footer
- * means an SSTable either exists, fully, or it doesn't — there's no
- * intermediate state where the data file is there but the bloom filter
- * isn't.
- *
  * File layout:
- *   [data section]   sorted records: keyLen(4) valueLen(4, -1=tombstone) key value
+ *   [data section]   sorted records: keyLen(4) valueLen(4, -1=tombstone) checksum(4) key value
  *   [index section]  SparseIndex.toBytes()
  *   [bloom section]  BloomFilter.toBytes()
- *   [footer]         self-describing trailer, see writeFooter()
- *   [footerLen: int32]   <- last 4 bytes of the file, so the reader can
- *                            always find the footer by seeking from the end
- *                            without needing to know anything else first
+ *   [footer]         self-describing trailer with format version
+ *   [footerLen: int32]   <- last 4 bytes of the file
+ *
+ * The checksum field (CRC32 over key bytes || value bytes) is placed in the
+ * header, before the key/value payload, so a reader can verify integrity as
+ * it scans without needing to read the full record first. A tombstone record
+ * checksums only the key (value is absent). Any mismatch is treated as silent
+ * disk corruption and raises IOException immediately — unlike a WAL truncated
+ * record (which is an expected crash shape), a bad checksum in a compacted
+ * SSTable is never a normal recovery scenario.
+ *
+ * Format version 2 adds the per-record checksum field. The footer carries the
+ * version so SSTableReader can handle both v1 (legacy, no checksum) and v2
+ * files during a rolling upgrade. Once all files are compacted through v2,
+ * v1 support can be dropped.
  */
 public final class SSTableWriter {
 
     /** Sample one key into the sparse index every BLOCK_INTERVAL records. */
     private static final int BLOCK_INTERVAL = 128;
     private static final double BLOOM_FALSE_POSITIVE_RATE = 0.01;
+
+    /** Record header size: keyLen(4) + valueLen(4) + checksum(4). */
+    static final int RECORD_HEADER = 12;
+
+    /** Format version written into the footer. */
+    static final int FORMAT_VERSION = 2;
 
     private final Path dir;
 
@@ -64,7 +74,7 @@ public final class SSTableWriter {
             long offset = 0;
             for (Map.Entry<byte[], byte[]> e : snapshot.entrySet()) {
                 byte[] key = e.getKey();
-                byte[] value = e.getValue(); // null == tombstone, written through as-is
+                byte[] value = e.getValue(); // null == tombstone
 
                 if (minKey == null) minKey = key;
                 maxKey = key;
@@ -75,9 +85,13 @@ public final class SSTableWriter {
                 }
 
                 int valueLen = (value == null) ? -1 : value.length;
-                ByteBuffer record = ByteBuffer.allocate(8 + key.length + (value == null ? 0 : value.length));
+                int checksum = recordChecksum(key, value);
+                int payloadLen = key.length + (value == null ? 0 : value.length);
+
+                ByteBuffer record = ByteBuffer.allocate(RECORD_HEADER + payloadLen);
                 record.putInt(key.length);
                 record.putInt(valueLen);
+                record.putInt(checksum);
                 record.put(key);
                 if (value != null) record.put(value);
                 record.flip();
@@ -106,6 +120,7 @@ public final class SSTableWriter {
                         + 4 + minKey.length  // minKeyLen + minKey
                         + 4 + maxKey.length  // maxKeyLen + maxKey
                         + 4                  // entryCount
+                        + 4                  // formatVersion (v2)
         );
         footer.putLong(dataLength);
         footer.putInt(indexLength);
@@ -115,10 +130,19 @@ public final class SSTableWriter {
         footer.putInt(maxKey.length);
         footer.put(maxKey);
         footer.putInt(entryCount);
+        footer.putInt(FORMAT_VERSION);
         footer.flip();
 
         int footerLength = footer.remaining();
         dc.write(footer);
         dc.write(ByteBuffer.allocate(4).putInt(footerLength).flip());
+    }
+
+    /** CRC32 over key bytes then value bytes (or just key bytes for a tombstone). */
+    static int recordChecksum(byte[] key, byte[] value) {
+        CRC32 crc = new CRC32();
+        crc.update(key);
+        if (value != null) crc.update(value);
+        return (int) crc.getValue();
     }
 }

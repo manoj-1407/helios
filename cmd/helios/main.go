@@ -27,14 +27,23 @@ func main() {
 	kvPort    := flag.String("kvport",  "18080",                    "helios-kv HTTP port")
 	redisAddr := flag.String("redis",   ":7379",                    "redis-wire listen address")
 	dashAddr  := flag.String("dash",    ":8080",                    "dashboard listen address")
+	authToken := flag.String("auth",    "",                         "shared secret for X-Helios-Token auth (empty = disabled)")
 	flag.Parse()
 
-	fmt.Printf("helios node %s\n  jvm=%s mode=%s  redis=%s  dashboard=http://localhost%s\n\n",
-		*id, *jvmAddr, *kvMode, *redisAddr, *dashAddr)
+	authStatus := "disabled"
+	if *authToken != "" {
+		authStatus = "enabled"
+	}
+	fmt.Printf("helios node %s\n  jvm=%s mode=%s  redis=%s  dashboard=http://localhost%s  auth=%s\n\n",
+		*id, *jvmAddr, *kvMode, *redisAddr, *dashAddr, authStatus)
 
 	// 1. start helios-kv JVM
 	jvmData, _ := os.MkdirTemp("", "helios-kv-"+*id+"-*")
-	jvmCmd := exec.Command("java", "-jar", *jvmJar, jvmData, *kvPort, *kvMode)
+	jvmArgs := []string{"-jar", *jvmJar, jvmData, *kvPort, *kvMode}
+	if *authToken != "" {
+		jvmArgs = append(jvmArgs, *authToken)
+	}
+	jvmCmd := exec.Command("java", jvmArgs...)
 	jvmCmd.Stdout = os.Stdout
 	jvmCmd.Stderr = os.Stderr
 	if err := jvmCmd.Start(); err != nil {
@@ -44,7 +53,7 @@ func main() {
 	defer func() { jvmCmd.Process.Kill(); os.RemoveAll(jvmData) }()
 
 	// 2. wait for JVM health
-	bridge := store.NewHeliosKVBridge(*jvmAddr)
+	bridge := store.NewHeliosKVBridgeWithAuth(*jvmAddr, *authToken)
 	fmt.Printf("waiting for JVM at %s...\n", *jvmAddr)
 	for i := 0; i < 60; i++ {
 		time.Sleep(500 * time.Millisecond)
@@ -89,7 +98,7 @@ func main() {
 
 	// 5. redis-wire server
 	go func() {
-		rs, err := client.NewRESPServer([]string{*jvmAddr}, *redisAddr)
+		rs, err := client.NewRESPServerWithAuth([]string{*jvmAddr}, *redisAddr, *authToken)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "redis server:", err)
 			return

@@ -68,6 +68,7 @@ func (m *BridgeMetrics) Snapshot() []DataPoint {
 // how fast it can apply entries (and therefore how much it lags).
 type HeliosKVBridge struct {
 	baseURL string
+	token   string // optional shared secret; empty means no auth
 	client  *http.Client
 	Metrics *BridgeMetrics
 
@@ -75,8 +76,13 @@ type HeliosKVBridge struct {
 }
 
 func NewHeliosKVBridge(addr string) *HeliosKVBridge {
+	return NewHeliosKVBridgeWithAuth(addr, "")
+}
+
+func NewHeliosKVBridgeWithAuth(addr, token string) *HeliosKVBridge {
 	return &HeliosKVBridge{
 		baseURL: "http://" + addr,
+		token:   token,
 		client: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -85,6 +91,13 @@ func NewHeliosKVBridge(addr string) *HeliosKVBridge {
 			},
 		},
 		Metrics: &BridgeMetrics{},
+	}
+}
+
+// setAuthHeader attaches X-Helios-Token to the request when a token is configured.
+func (b *HeliosKVBridge) setAuthHeader(req *http.Request) {
+	if b.token != "" {
+		req.Header.Set("X-Helios-Token", b.token)
 	}
 }
 
@@ -138,27 +151,63 @@ func (b *HeliosKVBridge) Get(ctx context.Context, key string) (string, bool, err
 	return string(body), true, nil
 }
 
+// Snapshot flushes the helios-kv MemTable and returns a tar.gz of the
+// entire SSTable data directory. The Raft layer calls this on the leader
+// to produce snapshot bytes that are shipped to lagging followers via
+// InstallSnapshot. The /snapshot endpoint in HeliosServer.java handles
+// the flush + archive; we just stream the response body here.
 func (b *HeliosKVBridge) Snapshot() ([]byte, error) {
-	// For now: serialize the stats as a minimal snapshot marker.
-	// Real snapshotting (flushing the Java MemTable and streaming SSTables)
-	// is tracked as a known limitation in the README — it requires adding a
-	// /snapshot endpoint to HeliosServer that returns a tar of the data dir.
-	stats, err := b.fetchStats()
+	req, err := http.NewRequest(http.MethodGet, b.baseURL+"/snapshot", nil)
 	if err != nil {
-		return nil, fmt.Errorf("bridge: snapshot stats: %w", err)
+		return nil, fmt.Errorf("bridge: snapshot: build request: %w", err)
 	}
-	return json.Marshal(stats)
+	b.setAuthHeader(req)
+	// Snapshot can be slow (flushing MemTable + creating tar.gz of all SSTables).
+	// Use a dedicated long-timeout client rather than the normal 2s one.
+	snapClient := &http.Client{Timeout: 120 * time.Second}
+	resp, err := snapClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge: snapshot: status %d: %s", resp.StatusCode, body)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: snapshot: read body: %w", err)
+	}
+	return data, nil
 }
 
+// Restore replaces this node's storage state with a snapshot received from
+// the leader. It POSTs the tar.gz to /restore on the local JVM, which stops
+// the DB, unpacks the archive over its data directory, and reopens the engine.
 func (b *HeliosKVBridge) Restore(data []byte) error {
-	// Corresponding limitation: restore is a no-op until the snapshot
-	// endpoint exists. A follower that falls too far behind currently
-	// can't catch up via snapshot — only via log replay from index 0.
+	req, err := http.NewRequest(http.MethodPost, b.baseURL+"/restore", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("bridge: restore: build request: %w", err)
+	}
+	b.setAuthHeader(req)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	// Restore also involves decompressing and writing potentially many SSTables.
+	restoreClient := &http.Client{Timeout: 120 * time.Second}
+	resp, err := restoreClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("bridge: restore: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bridge: restore: status %d: %s", resp.StatusCode, body)
+	}
 	return nil
 }
 
 func (b *HeliosKVBridge) Health(ctx context.Context) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+"/health", nil)
+	b.setAuthHeader(req)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return err
@@ -172,6 +221,7 @@ func (b *HeliosKVBridge) Health(ctx context.Context) error {
 
 func (b *HeliosKVBridge) fetchStats() (*StatsSnapshot, error) {
 	req, _ := http.NewRequest(http.MethodGet, b.baseURL+"/stats", nil)
+	b.setAuthHeader(req)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -194,6 +244,7 @@ func (b *HeliosKVBridge) postRaw(path, body string) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	b.setAuthHeader(req)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -218,6 +269,8 @@ func (b *HeliosKVBridge) PushPressure(pressure float64) error {
 	_, _, err := b.postRaw("/pressure", body)
 	return err
 }
+
+func (b *HeliosKVBridge) Token() string { return b.token }
 
 func (b *HeliosKVBridge) FetchStats() (*StatsSnapshot, error) {
 	return b.fetchStats()

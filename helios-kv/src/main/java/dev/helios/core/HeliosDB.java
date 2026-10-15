@@ -303,4 +303,43 @@ public final class HeliosDB implements AutoCloseable {
         }
         wal.close();
     }
+
+    /**
+     * Forces the active MemTable to disk as an SSTable without closing the DB.
+     * Called before taking a snapshot so all in-memory writes are included.
+     */
+    public synchronized void flushMemTable() throws IOException {
+        synchronized (flushLock) {
+            if (!active.isEmpty()) {
+                SSTable flushed = sstableWriter.flush(active.snapshot(), 0);
+                physicalBytesFlushed.addAndGet(Files.size(flushed.dataFile()));
+                sstables.add(flushed);
+                active = new MemTable(memTableMaxBytes);
+                wal.close();
+                wal = new WAL(walDir.resolve(System.nanoTime() + ".log"));
+            }
+        }
+    }
+
+    /**
+     * Reinitializes the DB engine from a data directory that was just replaced
+     * by a snapshot restore. Called after /restore unpacks the tar.gz.
+     */
+    public synchronized void reopen(Path newDataDir) throws IOException {
+        compactionManager.stop();
+        flushExecutor.shutdown();
+
+        RecoveryManager.RecoveredState recovered = RecoveryManager.recover(newDataDir, memTableMaxBytes);
+        sstables.clear();
+        sstables.addAll(recovered.sstables());
+        if (!recovered.memTable().isEmpty()) {
+            SSTable f = sstableWriter.flush(recovered.memTable().snapshot(), 0);
+            sstables.add(f);
+        }
+        for (Path old : recovered.walFilesToCleanUp()) Files.deleteIfExists(old);
+
+        active = new MemTable(memTableMaxBytes);
+        wal = new WAL(walDir.resolve(System.nanoTime() + ".log"));
+        compactionManager.start();
+    }
 }

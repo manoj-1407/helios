@@ -6,9 +6,11 @@ import dev.helios.compaction.CompactionManager;
 import dev.helios.core.HeliosDB;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
@@ -17,11 +19,20 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class HeliosServer {
 
     private final HeliosDB db;
+    private final Path dataDir;
     private final HttpServer server;
     private final AtomicLong compactionEvents = new AtomicLong(0);
     private final AtomicReference<String> lastStrategy = new AtomicReference<>("none");
+    /** Shared secret for X-Helios-Token auth; null means auth disabled. */
+    private final String authToken;
 
     public HeliosServer(Path dataDir, int port, CompactionManager.Mode mode) throws IOException {
+        this(dataDir, port, mode, null);
+    }
+
+    public HeliosServer(Path dataDir, int port, CompactionManager.Mode mode, String authToken) throws IOException {
+        this.dataDir = dataDir;
+        this.authToken = authToken;
         this.db = new HeliosDB(dataDir, 4 * 1024 * 1024, mode);
         this.server = HttpServer.create(new InetSocketAddress(port), 128);
         this.server.setExecutor(Executors.newFixedThreadPool(8));
@@ -30,7 +41,22 @@ public final class HeliosServer {
         server.createContext("/delete",   this::handleDelete);
         server.createContext("/stats",    this::handleStats);
         server.createContext("/pressure", this::handlePressure);
+        server.createContext("/snapshot", this::handleSnapshot);
+        server.createContext("/restore",  this::handleRestore);
+        // /health is intentionally unauthenticated so the Go bridge can poll it before auth is set up
         server.createContext("/health",   ex -> respond(ex, 200, "ok"));
+    }
+
+    /**
+     * Returns true if the request carries a valid auth token, or if auth is disabled.
+     * Sends a 401 and returns false otherwise — callers just return immediately on false.
+     */
+    private boolean authorized(HttpExchange ex) throws IOException {
+        if (authToken == null || authToken.isEmpty()) return true;
+        String header = ex.getRequestHeaders().getFirst("X-Helios-Token");
+        if (authToken.equals(header)) return true;
+        respond(ex, 401, "unauthorized");
+        return false;
     }
 
     public void start() { server.start(); }
@@ -41,6 +67,7 @@ public final class HeliosServer {
     }
 
     private void handlePut(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
         if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
         byte[] body = ex.getRequestBody().readAllBytes();
         String raw = new String(body, StandardCharsets.UTF_8);
@@ -56,6 +83,7 @@ public final class HeliosServer {
     }
 
     private void handleGet(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
         if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
         byte[] key = ex.getRequestBody().readAllBytes();
         byte[] value = db.get(key);
@@ -64,6 +92,7 @@ public final class HeliosServer {
     }
 
     private void handleDelete(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
         if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
         byte[] key = ex.getRequestBody().readAllBytes();
         db.delete(key);
@@ -71,6 +100,7 @@ public final class HeliosServer {
     }
 
     private void handleStats(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
         String strategy = db.activeCompactionStrategy();
         String prev = lastStrategy.getAndSet(strategy);
         boolean changed = !strategy.equals(prev);
@@ -81,7 +111,92 @@ public final class HeliosServer {
         respond(ex, 200, body);
     }
 
+    /**
+     * GET /snapshot — streams a tar.gz of the dataDir so a Raft leader can
+     * ship the full storage state to a lagging follower via InstallSnapshot.
+     * The Go bridge reads this body and passes it as InstallSnapshotRequest.Data.
+     */
+    private void handleSnapshot(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
+        if (!ex.getRequestMethod().equals("GET")) { respond(ex, 405, "method not allowed"); return; }
+        db.flushMemTable(); // make sure all in-memory state is on disk before we tar it
+        byte[] tarGz = tarGzDir(dataDir);
+        ex.getResponseHeaders().set("Content-Type", "application/octet-stream");
+        ex.sendResponseHeaders(200, tarGz.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(tarGz); }
+    }
+
+    /**
+     * POST /restore — receives a tar.gz snapshot, stops the DB, unpacks over
+     * dataDir, and reopens the storage engine. Called by the Go bridge on a
+     * follower after HandleInstallSnapshot.
+     */
+    private void handleRestore(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
+        if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
+        try (InputStream body = ex.getRequestBody()) {
+            byte[] tarGz = body.readAllBytes();
+            db.close();
+            deleteDirContents(dataDir);
+            untarGzDir(tarGz, dataDir);
+            db.reopen(dataDir);
+        }
+        respond(ex, 200, "ok");
+    }
+
+    /** Creates a gzip-compressed tar archive of a directory in memory. */
+    private static byte[] tarGzDir(Path dir) throws IOException {
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        try (var gz = new java.util.zip.GZIPOutputStream(baos);
+             var tar = new java.io.DataOutputStream(gz)) {
+            Files.walk(dir)
+                 .filter(Files::isRegularFile)
+                 .forEach(p -> {
+                     try {
+                         String name = dir.relativize(p).toString();
+                         byte[] data = Files.readAllBytes(p);
+                         // Simple header: nameLen(4) name(n) dataLen(4) data(n)
+                         tar.writeInt(name.length());
+                         tar.write(name.getBytes(StandardCharsets.UTF_8));
+                         tar.writeInt(data.length);
+                         tar.write(data);
+                     } catch (IOException e) { throw new RuntimeException(e); }
+                 });
+        }
+        return baos.toByteArray();
+    }
+
+    private static void untarGzDir(byte[] tarGz, Path dir) throws IOException {
+        Files.createDirectories(dir);
+        try (var gz = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(tarGz));
+             var din = new java.io.DataInputStream(gz)) {
+            try {
+                while (true) {
+                    int nameLen = din.readInt();
+                    byte[] nameBytes = din.readNBytes(nameLen);
+                    String name = new String(nameBytes, StandardCharsets.UTF_8);
+                    int dataLen = din.readInt();
+                    byte[] data = din.readNBytes(dataLen);
+                    Path target = dir.resolve(name).normalize();
+                    if (!target.startsWith(dir)) continue; // path traversal guard
+                    Files.createDirectories(target.getParent());
+                    Files.write(target, data);
+                }
+            } catch (java.io.EOFException ignored) { /* end of archive */ }
+        }
+    }
+
+    private static void deleteDirContents(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var s = Files.walk(dir)) {
+            s.sorted(java.util.Comparator.reverseOrder())
+             .filter(p -> !p.equals(dir))
+             .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
+        }
+    }
+
     private void handlePressure(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
         if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
         String body = new String(ex.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
         try {
@@ -102,7 +217,7 @@ public final class HeliosServer {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("usage: HeliosServer <dataDir> <port> [ADAPTIVE|LEVELED|TIERED]");
+            System.err.println("usage: HeliosServer <dataDir> <port> [ADAPTIVE|LEVELED|TIERED] [authToken]");
             System.exit(1);
         }
         Path dataDir = Path.of(args[0]);
@@ -110,9 +225,11 @@ public final class HeliosServer {
         CompactionManager.Mode mode = args.length > 2
             ? CompactionManager.Mode.valueOf(args[2].toUpperCase())
             : CompactionManager.Mode.ADAPTIVE;
-        HeliosServer srv = new HeliosServer(dataDir, port, mode);
+        String authToken = args.length > 3 ? args[3] : null;
+        HeliosServer srv = new HeliosServer(dataDir, port, mode, authToken);
         srv.start();
-        System.out.printf("[helios-kv] listening on :%d  data=%s  mode=%s%n", port, dataDir, mode);
+        System.out.printf("[helios-kv] listening on :%d  data=%s  mode=%s  auth=%s%n",
+            port, dataDir, mode, authToken != null ? "enabled" : "disabled");
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try { srv.stop(); } catch (Exception e) { e.printStackTrace(); }
         }));

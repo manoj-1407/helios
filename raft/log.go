@@ -245,3 +245,102 @@ func (l *RaftLog) Slice(lo, hi uint64) []LogEntry {
 func (l *RaftLog) Close() error {
 	return l.file.Close()
 }
+
+// TermAt returns the term of the entry at the given index.
+// Returns 0, nil for the sentinel (index 0).
+// Returns 0, error if the index is out of range.
+func (l *RaftLog) TermAt(index uint64) (uint64, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if index >= uint64(len(l.entries)) {
+		return 0, fmt.Errorf("log: TermAt(%d) out of range (len=%d)", index, len(l.entries))
+	}
+	return l.entries[index].Term, nil
+}
+
+// CompactTo removes all entries with Index ≤ upTo from the in-memory slice
+// and truncates the backing file to remove only the compacted records.
+// This is called after a snapshot is persisted so the log doesn't grow
+// forever. Unlike TruncateFrom (which removes a diverging suffix),
+// CompactTo removes a committed prefix.
+//
+// The sentinel at position 0 is replaced with a placeholder entry at
+// upTo so that LastIndexAndTerm() and Slice() continue to work — the
+// "last entry before our window" is still addressable.
+func (l *RaftLog) CompactTo(upTo uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if upTo == 0 || upTo >= uint64(len(l.entries)) {
+		return nil // nothing to compact or already past the end
+	}
+
+	// The file offset where the first kept entry starts.
+	keepFrom := int64(l.offsets[upTo+1]) // offsets has len(entries) elements
+
+	// Compact in memory: replace entries[0..upTo] with a single sentinel
+	// at upTo carrying the right term/index so log lookups still work.
+	// (The file content for those entries is gone after the truncate below.)
+	kept := l.entries[upTo+1:]
+	sentinel := LogEntry{Term: l.entries[upTo].Term, Index: upTo, Command: nil}
+	newEntries := make([]LogEntry, 1+len(kept))
+	newEntries[0] = sentinel
+	copy(newEntries[1:], kept)
+
+	keptOffsets := l.offsets[upTo+1:]
+	newOffsets := make([]int64, 1+len(keptOffsets))
+	newOffsets[0] = 0
+	// Shift file offsets so they're relative to the new file start.
+	for i, off := range keptOffsets {
+		newOffsets[i+1] = off - keepFrom
+	}
+
+	// Rewrite file: copy the tail we're keeping to a temp path, then rename.
+	// This avoids the window where the file is partly overwritten.
+	tmpPath := l.path + ".compact.tmp"
+	tmpF, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("log compact: open tmp: %w", err)
+	}
+
+	// Read the tail from the current file.
+	tailLen, err := l.file.Seek(0, 2) // seek to end to know file size
+	if err != nil {
+		tmpF.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("log compact: seek: %w", err)
+	}
+	tail := make([]byte, tailLen-keepFrom)
+	if _, err := l.file.ReadAt(tail, keepFrom); err != nil {
+		tmpF.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("log compact: read tail: %w", err)
+	}
+	if _, err := tmpF.Write(tail); err != nil {
+		tmpF.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("log compact: write tmp: %w", err)
+	}
+	if err := tmpF.Sync(); err != nil {
+		tmpF.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("log compact: sync tmp: %w", err)
+	}
+	tmpF.Close()
+
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("log compact: rename: %w", err)
+	}
+
+	// Re-open so we have a writable handle to the new file.
+	l.file.Close()
+	newF, err := os.OpenFile(l.path, os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("log compact: reopen: %w", err)
+	}
+	l.file = newF
+	l.entries = newEntries
+	l.offsets = newOffsets
+	return nil
+}

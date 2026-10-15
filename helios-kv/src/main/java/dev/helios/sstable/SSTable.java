@@ -22,6 +22,9 @@ public final class SSTable {
     private final byte[] minKey;
     private final byte[] maxKey;
     private final int entryCount;
+    // Set by SSTableReader.open() after reading the footer; defaults to 2 for
+    // freshly-written tables (which are always v2). Only v1 legacy files get 1.
+    private int formatVersion = SSTableWriter.FORMAT_VERSION;
 
     public SSTable(Path dataFile, BloomFilter bloomFilter, SparseIndex sparseIndex,
                    int level, long id, byte[] minKey, byte[] maxKey, int entryCount) {
@@ -43,6 +46,8 @@ public final class SSTable {
     public byte[] minKey() { return minKey; }
     public byte[] maxKey() { return maxKey; }
     public int entryCount() { return entryCount; }
+    public int formatVersion() { return formatVersion; }
+    public void setFormatVersion(int v) { this.formatVersion = v; }
 
     /** Cheap pre-filter before even touching the bloom filter or the file: is the key in this table's key range at all? */
     public boolean mayContainRange(byte[] key) {
