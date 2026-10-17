@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # scrape the dashboard's aggregated /metrics — one target covers the whole cluster
+  - job_name: helios_cluster
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          cluster: helios
+
+  # per-node JVM scrapes — useful if you run without the dashboard,
+  # or want raw JVM metrics alongside the aggregated ones
+  - job_name: helios_jvm_node0
+    static_configs:
+      - targets: ['host.docker.internal:18080']
+        labels:
+          node: node0
+
+  - job_name: helios_jvm_node1
+    static_configs:
+      - targets: ['host.docker.internal:18081']
+        labels:
+          node: node1
+
+  - job_name: helios_jvm_node2
+    static_configs:
+      - targets: ['host.docker.internal:18082']
+        labels:
+          node: node2

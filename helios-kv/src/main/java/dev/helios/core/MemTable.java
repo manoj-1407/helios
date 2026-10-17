@@ -108,6 +108,35 @@ public final class MemTable {
      * guarantee (no sentinel ever escapes this file) instead of a fake
      * "zero-copy" that quietly corrupts deletes into empty-value writes.
      */
+    /**
+     * Returns all entries whose key starts with prefix, with TOMBSTONE translated
+     * back to null (null value = deleted key). Used by HeliosDB.scan() to merge
+     * in-memory state with SSTable results.
+     */
+    public NavigableMap<byte[], byte[]> prefixScan(byte[] prefix) {
+        NavigableMap<byte[], byte[]> result = new TreeMap<>(Arrays::compareUnsigned);
+        if (prefix.length == 0) {
+            // empty prefix: everything
+            for (Map.Entry<byte[], byte[]> e : table.entrySet()) {
+                result.put(e.getKey(), e.getValue() == TOMBSTONE ? null : e.getValue());
+            }
+            return result;
+        }
+        // compute exclusive upper bound
+        byte[] prefixEnd = null;
+        byte[] inc = prefix.clone();
+        for (int i = inc.length - 1; i >= 0; i--) {
+            if ((inc[i] & 0xFF) < 0xFF) { inc[i]++; prefixEnd = inc; break; }
+        }
+        NavigableMap<byte[], byte[]> sub = (prefixEnd != null)
+            ? table.subMap(prefix, true, prefixEnd, false)
+            : table.tailMap(prefix, true);
+        for (Map.Entry<byte[], byte[]> e : sub.entrySet()) {
+            result.put(e.getKey(), e.getValue() == TOMBSTONE ? null : e.getValue());
+        }
+        return result;
+    }
+
     public NavigableMap<byte[], byte[]> snapshot() {
         NavigableMap<byte[], byte[]> copy = new TreeMap<>(Arrays::compareUnsigned);
         for (Map.Entry<byte[], byte[]> e : table.entrySet()) {

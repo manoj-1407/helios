@@ -43,6 +43,8 @@ public final class HeliosServer {
         server.createContext("/pressure", this::handlePressure);
         server.createContext("/snapshot", this::handleSnapshot);
         server.createContext("/restore",  this::handleRestore);
+        server.createContext("/scan",     this::handleScan);
+        server.createContext("/metrics",  this::handleMetrics);
         // /health is intentionally unauthenticated so the Go bridge can poll it before auth is set up
         server.createContext("/health",   ex -> respond(ex, 200, "ok"));
     }
@@ -97,6 +99,44 @@ public final class HeliosServer {
         byte[] key = ex.getRequestBody().readAllBytes();
         db.delete(key);
         respond(ex, 200, "ok");
+    }
+
+    /**
+     * POST /scan — body is a UTF-8 prefix string; returns a JSON object
+     * {"key":"value",...} of all live keys that start with that prefix.
+     * Empty body means "scan everything". Keys and values are returned as
+     * UTF-8 strings (matching what PUT/GET use on the wire).
+     */
+    private void handleScan(HttpExchange ex) throws IOException {
+        if (!authorized(ex)) return;
+        if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "method not allowed"); return; }
+        byte[] prefixBytes = ex.getRequestBody().readAllBytes();
+        java.util.Map<byte[], byte[]> results = db.scan(prefixBytes);
+
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (java.util.Map.Entry<byte[], byte[]> e : results.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            String k = new String(e.getKey(),   java.nio.charset.StandardCharsets.UTF_8);
+            String v = new String(e.getValue(), java.nio.charset.StandardCharsets.UTF_8);
+            sb.append(jsonQuote(k)).append(":").append(jsonQuote(v));
+        }
+        sb.append("}");
+        respond(ex, 200, sb.toString());
+    }
+
+    /** Minimal JSON string quoting — escapes backslash, double-quote, and control chars. */
+    private static String jsonQuote(String s) {
+        StringBuilder out = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if      (c == '"')  out.append("\\\"");
+            else if (c == '\\') out.append("\\\\");
+            else if (c < 0x20)  out.append(String.format("\\u%04x", (int) c));
+            else                out.append(c);
+        }
+        return out.append("\"").toString();
     }
 
     private void handleStats(HttpExchange ex) throws IOException {
@@ -206,6 +246,77 @@ public final class HeliosServer {
         } catch (NumberFormatException e) {
             respond(ex, 400, "expected a float in [0.0, 1.0]");
         }
+    }
+
+    /**
+     * GET /metrics — Prometheus text format (no library required).
+     * Intentionally unauthenticated: Prometheus scrapers don't carry tokens,
+     * and all values here are operational metrics, not user data. If you need
+     * to lock this down, put the scraper behind the same network boundary as
+     * the node and firewall /metrics from the outside.
+     *
+     * Metrics exposed:
+     *   helios_write_amplification          gauge   physical/logical bytes ratio
+     *   helios_sstable_count                gauge   live SSTables on disk
+     *   helios_compaction_events_total      counter strategy-switch events seen
+     *   helios_logical_bytes_written_total  counter raw bytes the caller asked us to store
+     *   helios_physical_bytes_flushed_total counter bytes actually written to disk (flush+compaction)
+     *   helios_active_strategy              info    label=strategy, value always 1
+     */
+    private void handleMetrics(HttpExchange ex) throws IOException {
+        if (!ex.getRequestMethod().equals("GET")) { respond(ex, 405, "method not allowed"); return; }
+
+        String strategy   = db.activeCompactionStrategy();
+        double writeAmp   = db.writeAmplification();
+        int    sstCount   = db.sstableCount();
+        long   cmpEvents  = compactionEvents.get();
+        long   logical    = db.logicalBytesWritten();
+        long   physical   = db.physicalBytesFlushed();
+
+        // Prometheus text format: one line per sample, TYPE and HELP before first sample.
+        StringBuilder sb = new StringBuilder(512);
+        metric(sb, "helios_write_amplification",
+               "Physical-to-logical write ratio (1.0 = no amplification)",
+               "gauge", String.format("%.6f", writeAmp), null, null);
+        metric(sb, "helios_sstable_count",
+               "Number of live SSTables on disk",
+               "gauge", String.valueOf(sstCount), null, null);
+        metric(sb, "helios_compaction_events_total",
+               "Cumulative compaction strategy-switch events",
+               "counter", String.valueOf(cmpEvents), null, null);
+        metric(sb, "helios_logical_bytes_written_total",
+               "Raw bytes the caller asked to store (pre-amplification)",
+               "counter", String.valueOf(logical), null, null);
+        metric(sb, "helios_physical_bytes_flushed_total",
+               "Bytes written to disk including flush and compaction rewrites",
+               "counter", String.valueOf(physical), null, null);
+        // info-style metric: always value=1, carries the strategy as a label
+        metric(sb, "helios_active_strategy_info",
+               "Active compaction strategy (leveled / tiered / adaptive)",
+               "gauge", "1", "strategy", sanitizeLabel(strategy));
+
+        byte[] out = sb.toString().getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+        ex.sendResponseHeaders(200, out.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(out); }
+    }
+
+    /** Appends one Prometheus metric family (HELP + TYPE + one sample line) to sb. */
+    private static void metric(StringBuilder sb, String name, String help,
+                                String type, String value,
+                                String labelKey, String labelVal) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        sb.append("# TYPE ").append(name).append(' ').append(type).append('\n');
+        sb.append(name);
+        if (labelKey != null) {
+            sb.append('{').append(labelKey).append("=\"").append(labelVal).append("\"}");
+        }
+        sb.append(' ').append(value).append('\n');
+    }
+
+    /** Strips characters Prometheus label values can't contain. */
+    private static String sanitizeLabel(String s) {
+        return s == null ? "unknown" : s.replaceAll("[^A-Za-z0-9_\\-]", "_");
     }
 
     private static void respond(HttpExchange ex, int status, String body) throws IOException {

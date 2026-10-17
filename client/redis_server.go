@@ -162,6 +162,51 @@ func (s *RESPServer) dispatch(cmd string, args []string, w *bufio.Writer) {
 		}
 		writeInt(w, deleted)
 
+	// SCAN prefix — returns all keys starting with prefix as a RESP array
+	// of [key, value, key, value, ...] pairs (flat, not nested).
+	// SCAN with no args returns every key. Compatible with naive redis-cli
+	// usage; not cursor-based like Redis SCAN (helios has no partial iteration).
+	case "SCAN":
+		prefix := ""
+		if len(args) > 0 {
+			prefix = args[0]
+		}
+		kv, err := s.helios.Scan(ctx, prefix)
+		if err != nil {
+			writeError(w, err.Error())
+			return
+		}
+		// return as flat array: [k1, v1, k2, v2, ...]
+		fmt.Fprintf(w, "*%d\r\n", len(kv)*2)
+		for k, v := range kv {
+			writeBulk(w, k)
+			writeBulk(w, v)
+		}
+
+	// KEYS pattern — redis-compatible; we only support prefix* patterns for now.
+	// KEYS * returns everything; KEYS foo* returns keys starting with "foo".
+	case "KEYS":
+		pattern := "*"
+		if len(args) > 0 {
+			pattern = args[0]
+		}
+		prefix := ""
+		if pattern != "*" && strings.HasSuffix(pattern, "*") {
+			prefix = strings.TrimSuffix(pattern, "*")
+		} else if pattern != "*" {
+			// exact match pattern — treat as prefix of itself with no wildcard
+			prefix = pattern
+		}
+		kv, err := s.helios.Scan(ctx, prefix)
+		if err != nil {
+			writeError(w, err.Error())
+			return
+		}
+		fmt.Fprintf(w, "*%d\r\n", len(kv))
+		for k := range kv {
+			writeBulk(w, k)
+		}
+
 	case "COMMAND":
 		// redis-cli sends COMMAND DOCS or COMMAND COUNT on connect.
 		// Return an empty array to satisfy the handshake.

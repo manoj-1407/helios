@@ -52,7 +52,9 @@ func (s *Server) Start() {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/events", s.handleSSE)
 	mux.HandleFunc("/snapshot", s.handleSnapshot)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	fmt.Printf("[helios-dashboard] live at http://%s\n", s.addr)
+	fmt.Printf("[helios-dashboard] prometheus metrics at http://%s/metrics\n", s.addr)
 	http.ListenAndServe(s.addr, mux)
 }
 
@@ -113,6 +115,104 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(s.history)
+}
+
+// handleMetrics exposes a Prometheus-compatible /metrics endpoint that
+// aggregates the latest collected snapshot into per-node labeled metrics.
+// Prometheus scrapes this endpoint; point your prometheus.yml at the
+// dashboard addr (default :8080) rather than each individual JVM port.
+// The JVM also exposes /metrics directly for when you run without the
+// dashboard, but the dashboard endpoint is more convenient for multi-node
+// clusters since everything is in one scrape target.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	var snap ClusterSnapshot
+	if len(s.history) > 0 {
+		snap = s.history[len(s.history)-1]
+	}
+	s.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	pf := func(name, help, typ string) {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, typ)
+	}
+	lv := func(name string, labels map[string]string, value string) {
+		fmt.Fprintf(w, "%s{", name)
+		first := true
+		for k, v := range labels {
+			if !first {
+				fmt.Fprint(w, ",")
+			}
+			fmt.Fprintf(w, "%s=%q", k, v)
+			first = false
+		}
+		fmt.Fprintf(w, "} %s\n", value)
+	}
+
+	// ── raft cluster metrics ──────────────────────────────────────────────
+	pf("helios_raft_is_leader", "1 if this node is currently the Raft leader, else 0", "gauge")
+	for _, n := range snap.Nodes {
+		isLeader := "0"
+		if n.State == "leader" {
+			isLeader = "1"
+		}
+		lv("helios_raft_is_leader", map[string]string{"node": n.ID}, isLeader)
+	}
+
+	pf("helios_raft_term", "Current Raft term", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_raft_term", map[string]string{"node": n.ID}, fmt.Sprintf("%d", n.Term))
+	}
+
+	pf("helios_raft_commit_index", "Raft commit index", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_raft_commit_index", map[string]string{"node": n.ID}, fmt.Sprintf("%d", n.CommitIndex))
+	}
+
+	pf("helios_raft_replication_lag_entries", "Entries the leader is ahead of this node (0 on the leader itself)", "gauge")
+	for _, n := range snap.Nodes {
+		var lag uint64
+		if snap.LeaderID != "" && n.ID != snap.LeaderID {
+			// compute lag against leader commit index
+			for _, ln := range snap.Nodes {
+				if ln.ID == snap.LeaderID {
+					if ln.CommitIndex > n.CommitIndex {
+						lag = ln.CommitIndex - n.CommitIndex
+					}
+					break
+				}
+			}
+		}
+		lv("helios_raft_replication_lag_entries", map[string]string{"node": n.ID}, fmt.Sprintf("%d", lag))
+	}
+
+	// ── storage metrics ───────────────────────────────────────────────────
+	pf("helios_write_amplification", "Physical-to-logical write ratio (1.0 = no amplification)", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_write_amplification", map[string]string{"node": n.ID, "strategy": n.Strategy},
+			fmt.Sprintf("%.6f", n.WriteAmp))
+	}
+
+	pf("helios_sstable_count", "Number of live SSTables on disk", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_sstable_count", map[string]string{"node": n.ID}, fmt.Sprintf("%d", n.SstableCount))
+	}
+
+	pf("helios_replication_pressure", "Replication backpressure level [0.0, 1.0]", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_replication_pressure", map[string]string{"node": n.ID}, fmt.Sprintf("%.4f", n.PressureLevel))
+	}
+
+	pf("helios_active_strategy_info", "Active compaction strategy (always 1, label carries the name)", "gauge")
+	for _, n := range snap.Nodes {
+		lv("helios_active_strategy_info", map[string]string{"node": n.ID, "strategy": n.Strategy}, "1")
+	}
+
+	// cluster-level summary
+	fmt.Fprintf(w, "# HELP helios_cluster_max_lag_entries Highest replication lag across all followers\n")
+	fmt.Fprintf(w, "# TYPE helios_cluster_max_lag_entries gauge\n")
+	fmt.Fprintf(w, "helios_cluster_max_lag_entries %d\n", snap.MaxLag)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

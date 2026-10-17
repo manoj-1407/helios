@@ -178,6 +178,89 @@ public final class SSTableReader {
         return entries;
     }
 
+    /**
+     * Returns all non-tombstone entries whose key starts with the given prefix,
+     * in the key order they appear in this SSTable. The caller is responsible
+     * for merging results across multiple SSTables and applying tombstone
+     * shadowing (newer tables' tombstones hide older tables' values).
+     *
+     * Fast path: if the table's key range doesn't overlap the prefix at all
+     * (minKey > prefix-end or maxKey < prefix) the file is skipped with zero I/O.
+     */
+    public static List<RawEntry> scanPrefix(SSTable table, byte[] prefix) throws IOException {
+        if (prefix.length == 0) return scanAll(table); // empty prefix = everything
+
+        // compute the exclusive upper bound for the prefix: increment the last byte.
+        // if all bytes are 0xFF we can't increment, so treat it as an open-ended scan.
+        byte[] prefixEnd = null;
+        byte[] inc = prefix.clone();
+        for (int i = inc.length - 1; i >= 0; i--) {
+            if ((inc[i] & 0xFF) < 0xFF) {
+                inc[i]++;
+                prefixEnd = inc;
+                break;
+            }
+        }
+
+        // skip table entirely if its key range can't possibly overlap
+        if (table.minKey() != null && table.maxKey() != null) {
+            if (prefixEnd != null && java.util.Arrays.compareUnsigned(table.minKey(), prefixEnd) >= 0) return List.of();
+            if (java.util.Arrays.compareUnsigned(table.maxKey(), prefix) < 0) return List.of();
+        }
+
+        boolean verify = table.formatVersion() >= 2;
+        List<RawEntry> results = new java.util.ArrayList<>();
+        try (FileChannel ch = FileChannel.open(table.dataFile(), StandardOpenOption.READ)) {
+            long dataEnd = dataSectionEnd(ch);
+            long position = 0;
+            while (position < dataEnd) {
+                int headerSize = verify ? SSTableWriter.RECORD_HEADER : 8;
+                ByteBuffer header = ByteBuffer.allocate(headerSize);
+                readAt(ch, position, header);
+                header.flip();
+
+                int keyLen   = header.getInt();
+                int valueLen = header.getInt();
+                int storedChecksum = verify ? header.getInt() : 0;
+                position += headerSize;
+
+                byte[] key = new byte[keyLen];
+                readAt(ch, position, ByteBuffer.wrap(key));
+                position += keyLen;
+
+                byte[] value = null;
+                if (valueLen >= 0) {
+                    value = new byte[valueLen];
+                    readAt(ch, position, ByteBuffer.wrap(value));
+                    position += valueLen;
+                }
+
+                if (verify) {
+                    int got = SSTableWriter.recordChecksum(key, value);
+                    if (got != storedChecksum) {
+                        throw new IOException("SSTable checksum mismatch in scanPrefix at " + table.dataFile());
+                    }
+                }
+
+                // early exit once we've passed the prefix range
+                if (prefixEnd != null && java.util.Arrays.compareUnsigned(key, prefixEnd) >= 0) break;
+
+                if (startsWith(key, prefix)) {
+                    results.add(new RawEntry(key, value));
+                }
+            }
+        }
+        return results;
+    }
+
+    private static boolean startsWith(byte[] key, byte[] prefix) {
+        if (key.length < prefix.length) return false;
+        for (int i = 0; i < prefix.length; i++) {
+            if (key[i] != prefix[i]) return false;
+        }
+        return true;
+    }
+
     private static long dataSectionEnd(FileChannel ch) throws IOException {
         long fileSize = ch.size();
         ByteBuffer footerLenBuf = ByteBuffer.allocate(4);

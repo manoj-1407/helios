@@ -184,6 +184,51 @@ public final class HeliosDB implements AutoCloseable {
         return null; // genuinely never written, or written-and-already-compacted-away
     }
 
+    /**
+     * Returns all live (non-tombstoned) key-value pairs whose key starts with
+     * the given prefix, merged across the active MemTable, any in-flight flushing
+     * MemTables, and all SSTables. Newer writes shadow older ones; tombstones are
+     * applied so deleted keys never appear in the result.
+     *
+     * Result is sorted by key (unsigned byte order). Empty prefix returns everything.
+     */
+    public java.util.Map<byte[], byte[]> scan(byte[] prefix) throws IOException {
+        classifier.recordRead();
+
+        // Use a TreeMap with unsigned-byte comparator so results are in key order.
+        java.util.TreeMap<byte[], byte[]> merged = new java.util.TreeMap<>(java.util.Arrays::compareUnsigned);
+
+        // SSTables oldest-first so newer entries overwrite older ones in the map.
+        List<SSTable> tables = new java.util.ArrayList<>(sstables);
+        tables.sort(Comparator.comparingLong(SSTable::id)); // ascending = oldest first
+        for (SSTable table : tables) {
+            try {
+                for (SSTableReader.RawEntry e : SSTableReader.scanPrefix(table, prefix)) {
+                    merged.put(e.key(), e.value()); // value==null means tombstone
+                }
+            } catch (java.nio.file.NoSuchFileException ignored) {
+                // compaction removed this file; skip it (same tolerance as get())
+            }
+        }
+
+        // Flushing MemTables are newer than SSTables — apply in order (oldest first).
+        MemTable[] flushingArr = flushing.toArray(new MemTable[0]);
+        for (MemTable mt : flushingArr) {
+            for (var entry : mt.prefixScan(prefix).entrySet()) {
+                merged.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        // Active MemTable is newest.
+        for (var entry : active.prefixScan(prefix).entrySet()) {
+            merged.put(entry.getKey(), entry.getValue());
+        }
+
+        // Strip tombstones: null value means the key was deleted.
+        merged.entrySet().removeIf(e -> e.getValue() == null);
+        return merged;
+    }
+
     /** Distinguishes "key was deleted" from "key was never written" — get() alone can't, since both return null. */
     public boolean exists(byte[] key) throws IOException {
         classifier.recordRead();
@@ -270,6 +315,14 @@ public final class HeliosDB implements AutoCloseable {
 
     public int sstableCount() {
         return sstables.size();
+    }
+
+    public long logicalBytesWritten() {
+        return logicalBytesWritten.get();
+    }
+
+    public long physicalBytesFlushed() {
+        return physicalBytesFlushed.get() + compactionManager.physicalBytesWrittenByCompaction();
     }
 
     public String activeCompactionStrategy() {

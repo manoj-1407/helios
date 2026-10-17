@@ -9,6 +9,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -89,6 +90,33 @@ func (c *Client) Get(ctx context.Context, key string) (string, bool, error) {
 // Delete removes a key from the cluster.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.writeWithRetry(ctx, "/delete", key)
+}
+
+// Scan returns all live key-value pairs whose key starts with prefix.
+// Empty prefix returns every key in the store. Reads from the current
+// node (not necessarily the leader — reads are consistent at a single
+// node; for linearizable reads, use the leader).
+func (c *Client) Scan(ctx context.Context, prefix string) (map[string]string, error) {
+	addr := c.currentAddr()
+	url := fmt.Sprintf("http://%s/scan", addr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(prefix))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("helios scan: status %d: %s", resp.StatusCode, body)
+	}
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("helios scan: decode: %w", err)
+	}
+	return result, nil
 }
 
 // writeWithRetry sends a write to the known leader and retries on 503.

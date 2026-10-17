@@ -140,6 +140,32 @@ func (b *HeliosKVBridge) Apply(entry raft.LogEntry) error {
 	return nil
 }
 
+// Scan returns all live key-value pairs whose key starts with prefix.
+// Empty prefix returns every key in the store. The result map is keyed
+// by the full key string; ordering is not guaranteed by this layer
+// (the JVM returns JSON which doesn't preserve order).
+func (b *HeliosKVBridge) Scan(ctx context.Context, prefix string) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.baseURL+"/scan", bytes.NewBufferString(prefix))
+	if err != nil {
+		return nil, err
+	}
+	b.setAuthHeader(req)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge: scan: status %d: %s", resp.StatusCode, body)
+	}
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("bridge: scan: decode: %w", err)
+	}
+	return result, nil
+}
+
 func (b *HeliosKVBridge) Get(ctx context.Context, key string) (string, bool, error) {
 	body, status, err := b.postRaw("/get", key)
 	if err != nil {
