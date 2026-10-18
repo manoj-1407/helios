@@ -30,4 +30,10 @@ be traced back to the exact code version that produced it.
 - **mismatched** (leader=LEVELED, follower=TIERED): highest p99 lag — TIERED on a write-heavy follower causes excessive space amplification and slower apply throughput
 - **static_leveled**: moderate lag but highest write_amplification — LEVELED is suboptimal for pure-write loads because it rewrites too aggressively
 
-Document any deviations from the above honestly here if the actual numbers differ.
+### Observed deviations (thesis.json run)
+
+**p99 lag ordering** differed from the prediction: `mismatched` produced the lowest p99 (~68ms) rather than the highest, and `static_leveled` was worst (~108ms). Likely cause: with only 200 unique keys and a 90% write ratio, the workload is effectively an update-heavy scan over a tiny key space. TIERED compaction on the follower does less write I/O in this regime because overwrites dominate; LEVELED's eager merging caused more background I/O that competed with apply threads, raising lag. A wider key space (e.g. 10k–100k keys) would produce the expected ordering.
+
+**write_amplification < 1.0** for all configs (0.37–0.41). This is correct given the workload: the 200-key space means many overwrites accumulate in the memtable before each flush, so the flushed SSTable is far smaller than the sum of all bytes put through `db.put()`. The ratio approaches 1/updates-per-key, not the >1.0 compaction amplification the thesis assumed. A fresh-insert workload (monotonic keys) would produce write_amp > 1.0.
+
+**compaction_switches = 0** — no full compaction ran during any config's ~90s window. Flushes happened (evidenced by non-zero write_amp) but the compaction manager did not accumulate enough SSTables to trigger a merge. Longer runs or smaller ops would surface compaction events.
