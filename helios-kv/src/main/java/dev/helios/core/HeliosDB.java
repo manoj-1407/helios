@@ -45,19 +45,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * (ConcurrentSkipListMap underneath MemTable, CopyOnWriteArrayList
  * underneath the SSTable list) is already lock-free.
  *
- * One known, accepted race: compaction publishes its new SSTable(s) and
- * retires the old references from the live list before deleting the old
- * files (see CompactionManager's class doc for why that ordering is
- * safe for *visibility*). It does NOT fully close the gap for a get()
- * that grabbed a reference to an old SSTable a moment before its file
- * gets deleted — that read can hit a vanished file. Rather than crash
- * the whole get() call over it, every per-table lookup below treats a
- * missing-file error as "this table is gone, move on to the next one"
- * — correct, because by definition a table can only disappear once a
- * newer compacted replacement covering the same keys already exists.
- * A real fix would be reference-counting open SSTables (don't delete
- * until every in-flight reader using one has finished); not implemented
- * here and called out as a known gap rather than silently worked around.
+ * Compaction publishes its new SSTable(s) and retires old references from
+ * the live list before releasing them (see CompactionManager's class doc for
+ * why that ordering is safe for *visibility*). {@link dev.helios.sstable.SSTable}
+ * is reference-counted: SSTableReader calls {@code retain()} before opening a
+ * file and {@code release()} in a {@code finally} block; CompactionManager
+ * calls {@code release()} instead of {@code Files.deleteIfExists()} when
+ * retiring a table. The file is not deleted until the last reader's
+ * {@code release()} brings the count to zero. A last-resort
+ * {@link java.nio.file.NoSuchFileException} guard remains in the lookup and
+ * scan paths as a belt-and-suspenders safety net for unforeseen edge cases,
+ * but under normal operation it should never fire.
  */
 public final class HeliosDB implements AutoCloseable {
 
@@ -206,8 +204,9 @@ public final class HeliosDB implements AutoCloseable {
                 for (SSTableReader.RawEntry e : SSTableReader.scanPrefix(table, prefix)) {
                     merged.put(e.key(), e.value()); // value==null means tombstone
                 }
-            } catch (java.nio.file.NoSuchFileException ignored) {
-                // compaction removed this file; skip it (same tolerance as get())
+            } catch (java.nio.file.NoSuchFileException e) {
+                // Last-resort safety net — should not happen with ref-counting (see lookupTolerant).
+                System.err.println("[helios-kv] WARN: SSTable file vanished during scan() — " + e.getMessage());
             }
         }
 
@@ -259,11 +258,22 @@ public final class HeliosDB implements AutoCloseable {
         return list;
     }
 
-    /** See class doc: a table whose file vanished mid-compaction is treated as a miss, not an error. */
+    /**
+     * See class doc: tolerates a vanished SSTable file on lookup.
+     *
+     * With ref-counting in place ({@link dev.helios.sstable.SSTable#retain()} /
+     * {@link dev.helios.sstable.SSTable#release()}) this path should never be
+     * hit in practice: the file is kept alive until every in-flight reader has
+     * called {@code release()}. The guard is kept as a last-resort safety net for
+     * unforeseen edge-cases (e.g. an external process deleting files, or a bug in
+     * the ref-counting logic) so a single stale reference doesn't crash reads.
+     */
     private SSTableReader.LookupResult lookupTolerant(SSTable table, byte[] key) throws IOException {
         try {
             return SSTableReader.get(table, key);
         } catch (NoSuchFileException e) {
+            System.err.println("[helios-kv] WARN: SSTable file vanished unexpectedly during get() — " +
+                               "this should not happen with ref-counting in place: " + e.getMessage());
             return null;
         }
     }

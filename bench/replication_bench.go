@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -238,6 +239,74 @@ func RunAll(ops int) ([]BenchResult, error) {
 	}
 	PrintSummary(results)
 	return results, nil
+}
+
+// ThesisReport is the serialisable form of a full benchmark run. Write it to
+// bench/results/thesis.json after collecting data so it can be committed and
+// compared across runs. The Grafana dashboard can consume it via the
+// SimpleJSON data source plugin if needed.
+type ThesisReport struct {
+	RunAt     string       `json:"run_at"`    // RFC3339
+	GitCommit string       `json:"git_commit"` // HEAD at time of run, empty if unknown
+	Ops       int          `json:"ops_per_config"`
+	WriteRatio float64     `json:"write_ratio"`
+	Results   []BenchResult `json:"results"`
+}
+
+// WriteJSON serialises results to a JSON file at the given path, creating
+// parent directories as needed. The output is formatted for readability so
+// it can be committed as-is without running through jq.
+func WriteJSON(results []BenchResult, ops int, writeRatio float64, path string) error {
+	if err := os.MkdirAll(filepath_dir(path), 0o755); err != nil {
+		return fmt.Errorf("bench: mkdir %s: %w", filepath_dir(path), err)
+	}
+
+	// best-effort: grab the current git commit hash so the file is traceable
+	gitHash := ""
+	if out, err := os.ReadFile(".git/HEAD"); err == nil {
+		ref := string(out)
+		// HEAD may be a SHA (detached) or "ref: refs/heads/main\n"
+		if len(ref) >= 40 {
+			gitHash = ref[:40]
+		} else if len(ref) > 5 && ref[:5] == "ref: " {
+			refPath := ".git/" + trimNL(ref[5:])
+			if sha, err2 := os.ReadFile(refPath); err2 == nil && len(sha) >= 40 {
+				gitHash = string(sha[:40])
+			}
+		}
+	}
+
+	report := ThesisReport{
+		RunAt:      time.Now().UTC().Format(time.RFC3339),
+		GitCommit:  gitHash,
+		Ops:        ops,
+		WriteRatio: writeRatio,
+		Results:    results,
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return fmt.Errorf("bench: marshal results: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("bench: write %s: %w", path, err)
+	}
+	return nil
+}
+
+func filepath_dir(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[:i]
+		}
+	}
+	return "."
+}
+
+func trimNL(s string) string {
+	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 func PrintSummary(results []BenchResult) {

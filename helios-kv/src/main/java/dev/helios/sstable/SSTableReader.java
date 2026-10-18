@@ -80,6 +80,7 @@ public final class SSTableReader {
         long startOffset = table.sparseIndex().floorOffset(key);
         boolean verify   = table.formatVersion() >= 2;
 
+        table.retain();
         try (FileChannel ch = FileChannel.open(table.dataFile(), StandardOpenOption.READ)) {
             long position = startOffset;
             long dataEnd  = dataSectionEnd(ch);
@@ -125,6 +126,8 @@ public final class SSTableReader {
                 }
                 // cmp < 0: keep scanning forward
             }
+        } finally {
+            table.release();
         }
         return LookupResult.NOT_FOUND;
     }
@@ -138,6 +141,7 @@ public final class SSTableReader {
     public static List<RawEntry> scanAll(SSTable table) throws IOException {
         boolean verify = table.formatVersion() >= 2;
         List<RawEntry> entries = new java.util.ArrayList<>(Math.max(table.entryCount(), 16));
+        table.retain();
         try (FileChannel ch = FileChannel.open(table.dataFile(), StandardOpenOption.READ)) {
             long dataEnd = dataSectionEnd(ch);
             long position = 0;
@@ -174,6 +178,8 @@ public final class SSTableReader {
 
                 entries.add(new RawEntry(key, value));
             }
+        } finally {
+            table.release();
         }
         return entries;
     }
@@ -210,6 +216,7 @@ public final class SSTableReader {
 
         boolean verify = table.formatVersion() >= 2;
         List<RawEntry> results = new java.util.ArrayList<>();
+        table.retain();
         try (FileChannel ch = FileChannel.open(table.dataFile(), StandardOpenOption.READ)) {
             long dataEnd = dataSectionEnd(ch);
             long position = 0;
@@ -249,6 +256,8 @@ public final class SSTableReader {
                     results.add(new RawEntry(key, value));
                 }
             }
+        } finally {
+            table.release();
         }
         return results;
     }

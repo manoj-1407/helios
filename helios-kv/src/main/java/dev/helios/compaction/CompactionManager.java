@@ -110,8 +110,14 @@ public final class CompactionManager {
             for (SSTable added : plan.toAdd()) {
                 physicalBytesWrittenByCompaction.addAndGet(Files.size(added.dataFile()));
             }
+            // Drop the live-list reference for each retired table.
+            // If no reader holds a retain() on the table its refCount reaches zero here
+            // and the file is deleted immediately. If a reader is mid-flight it holds its
+            // own retain(), so the count stays > 0 and the file survives until that
+            // reader's finally block fires release() — which then triggers the delete.
+            // We no longer call Files.deleteIfExists() directly; SSTable.release() does it.
             for (SSTable removed : plan.toRemove()) {
-                Files.deleteIfExists(removed.dataFile()); // only now is it safe to actually delete bytes
+                removed.release();
             }
         } catch (IOException e) {
             System.err.println("[helios-kv] compaction tick failed (will retry next tick): " + e);
