@@ -331,10 +331,12 @@ func PrintSummary(results []BenchResult) {
 
 func startHeliosKV(dataDir string, port int, mode string) *exec.Cmd {
 	// Jar lives at helios-kv/helios-kv.jar relative to the project root.
-	// dev.helios.Main args: server <dataDir> <port> [COMPACTION_MODE]
+	// dev.helios.Main args: server <dataDir> <port> [COMPACTION_MODE] [memTableBytes]
+	// 65536 (64 KiB) forces frequent flushes so compaction fires during the run,
+	// producing non-zero write_amplification metrics.
 	jar := "helios-kv/helios-kv.jar"
 	cmd := exec.Command("java", "-jar", jar,
-		"server", dataDir, fmt.Sprintf("%d", port), mode)
+		"server", dataDir, fmt.Sprintf("%d", port), mode, "65536")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

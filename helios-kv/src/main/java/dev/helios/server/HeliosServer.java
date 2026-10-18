@@ -27,13 +27,18 @@ public final class HeliosServer {
     private final String authToken;
 
     public HeliosServer(Path dataDir, int port, CompactionManager.Mode mode) throws IOException {
-        this(dataDir, port, mode, null);
+        this(dataDir, port, mode, null, 4 * 1024 * 1024);
     }
 
     public HeliosServer(Path dataDir, int port, CompactionManager.Mode mode, String authToken) throws IOException {
+        this(dataDir, port, mode, authToken, 4 * 1024 * 1024);
+    }
+
+    public HeliosServer(Path dataDir, int port, CompactionManager.Mode mode, String authToken,
+                        long memTableMaxBytes) throws IOException {
         this.dataDir = dataDir;
         this.authToken = authToken;
-        this.db = new HeliosDB(dataDir, 4 * 1024 * 1024, mode);
+        this.db = new HeliosDB(dataDir, memTableMaxBytes, mode);
         this.server = HttpServer.create(new InetSocketAddress(port), 128);
         this.server.setExecutor(Executors.newFixedThreadPool(8));
         server.createContext("/put",      this::handlePut);

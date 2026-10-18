@@ -22,7 +22,12 @@ public final class Main {
                 CompactionManager.Mode cMode = args.length > 3
                     ? CompactionManager.Mode.valueOf(args[3].toUpperCase())
                     : CompactionManager.Mode.ADAPTIVE;
-                HeliosServer srv = new HeliosServer(dataDir, port, cMode);
+                // optional 5th arg: memtable size in bytes (default 4 MiB)
+                // bench passes a small value (e.g. 65536) to force frequent flushes
+                long memTableBytes = args.length > 4
+                    ? Long.parseLong(args[4])
+                    : 4L * 1024 * 1024;
+                HeliosServer srv = new HeliosServer(dataDir, port, cMode, null, memTableBytes);
                 srv.start();
                 System.out.printf("[helios-kv] :%d  data=%s  mode=%s%n", port, dataDir, cMode);
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -56,7 +61,7 @@ public final class Main {
 
     private static void usage() {
         System.err.println("Usage:");
-        System.err.println("  Main server          <dataDir> <port> [ADAPTIVE|LEVELED|TIERED]");
+        System.err.println("  Main server          <dataDir> <port> [ADAPTIVE|LEVELED|TIERED] [memTableBytes]");
         System.err.println("  Main load            <dataDir> <count>");
         System.err.println("  Main verify          <dataDir> <count>");
         System.err.println("  Main loadcontinuous  <dataDir> <startIndex>");
