@@ -1,0 +1,59 @@
+{
+  "run_at": "2026-10-18T14:21:38Z",
+  "git_commit": "8e9c7bc0f0d1da47d397be23b2a6c4daf2ed46f8",
+  "ops_per_config": 50000,
+  "write_ratio": 0.9,
+  "results": [
+    {
+      "Config": {
+        "Name": "adaptive_both",
+        "LeaderMode": "ADAPTIVE",
+        "FollowerMode": "ADAPTIVE"
+      },
+      "Ops": 50000,
+      "DurationMs": 86936,
+      "OpsPerSec": 575.1348896866649,
+      "P50ApplyLagNs": 52648252,
+      "P99ApplyLagNs": 86467199,
+      "MaxApplyLagNs": 172410047,
+      "WriteAmplification": 0.4083,
+      "CompactionSwitches": 0,
+      "LagAfterCompaction": null,
+      "ApplyErrors": 35245
+    },
+    {
+      "Config": {
+        "Name": "mismatched",
+        "LeaderMode": "FORCE_LEVELED",
+        "FollowerMode": "FORCE_TIERED"
+      },
+      "Ops": 50000,
+      "DurationMs": 90684,
+      "OpsPerSec": 551.3608272421444,
+      "P50ApplyLagNs": 52337296,
+      "P99ApplyLagNs": 68250699,
+      "MaxApplyLagNs": 177169038,
+      "WriteAmplification": 0.3656,
+      "CompactionSwitches": 0,
+      "LagAfterCompaction": null,
+      "ApplyErrors": 34369
+    },
+    {
+      "Config": {
+        "Name": "static_leveled",
+        "LeaderMode": "FORCE_LEVELED",
+        "FollowerMode": "FORCE_LEVELED"
+      },
+      "Ops": 50000,
+      "DurationMs": 100508,
+      "OpsPerSec": 497.47246180501014,
+      "P50ApplyLagNs": 52105465,
+      "P99ApplyLagNs": 107831574,
+      "MaxApplyLagNs": 176881336,
+      "WriteAmplification": 0.3694,
+      "CompactionSwitches": 0,
+      "LagAfterCompaction": null,
+      "ApplyErrors": 32868
+    }
+  ]
+}
