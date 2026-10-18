@@ -146,6 +146,12 @@ public final class HeliosServer {
 
     private void handleStats(HttpExchange ex) throws IOException {
         if (!authorized(ex)) return;
+        // ?flush=1 forces a memtable flush + drain before reporting write_amplification.
+        // The per-apply polling path omits this; the bench's final FetchStats call adds it.
+        String query = ex.getRequestURI().getQuery();
+        if (query != null && query.contains("flush=1")) {
+            db.flushMemTable();
+        }
         String strategy = db.activeCompactionStrategy();
         String prev = lastStrategy.getAndSet(strategy);
         boolean changed = !strategy.equals(prev);

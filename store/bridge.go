@@ -298,6 +298,21 @@ func (b *HeliosKVBridge) PushPressure(pressure float64) error {
 
 func (b *HeliosKVBridge) Token() string { return b.token }
 
+// FetchStats calls /stats?flush=1 so the JVM flushes its active memtable and
+// drains async background flushes before reporting write_amplification. This
+// gives an accurate final reading; the per-Apply polling path uses fetchStats()
+// without the flush flag to avoid paying the I/O cost on every committed entry.
 func (b *HeliosKVBridge) FetchStats() (*StatsSnapshot, error) {
-	return b.fetchStats()
+	req, _ := http.NewRequest(http.MethodGet, b.baseURL+"/stats?flush=1", nil)
+	b.setAuthHeader(req)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var s StatsSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return nil, err
+	}
+	return &s, nil
 }

@@ -382,6 +382,13 @@ public final class HeliosDB implements AutoCloseable {
                 wal = new WAL(walDir.resolve(System.nanoTime() + ".log"));
             }
         }
+        // drain any async flushes already submitted by triggerFlush() so that
+        // physicalBytesFlushed reflects all completed work when the caller returns
+        try {
+            flushExecutor.submit(() -> {}).get(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException ignored) {}
     }
 
     /**
