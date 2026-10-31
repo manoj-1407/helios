@@ -39,6 +39,10 @@ public final class HeliosServer {
         this.dataDir = dataDir;
         this.authToken = authToken;
         this.db = new HeliosDB(dataDir, memTableMaxBytes, mode);
+        // without this, the JDK server writes headers and body separately and every
+        // request stalls ~44ms on nagle + delayed ack (research/RESEARCH_AUDIT.md F3).
+        // must be set before the first HttpServer is created in this JVM.
+        System.setProperty("sun.net.httpserver.nodelay", "true");
         this.server = HttpServer.create(new InetSocketAddress(port), 128);
         this.server.setExecutor(Executors.newFixedThreadPool(8));
         server.createContext("/put",      this::handlePut);

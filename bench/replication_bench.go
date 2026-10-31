@@ -130,7 +130,6 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 		return BenchResult{}, fmt.Errorf("no leader elected within 5s")
 	}
 
-	rng := rand.New(rand.NewSource(42))
 	start := time.Now()
 
 	var wg sync.WaitGroup
@@ -145,8 +144,11 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			key := fmt.Sprintf("key%d", rng.Intn(200))
-			if rng.Float64() < writeRatio {
+			// rand.Rand is not goroutine-safe: derive a per-op generator from the
+			// run seed so the workload is reproducible (F15)
+			lr := rand.New(rand.NewSource(42 + int64(n)))
+			key := fmt.Sprintf("key%d", lr.Intn(200))
+			if lr.Float64() < writeRatio {
 				cmd := store.EncodeCommand(store.Command{
 					Type:  store.CmdPut,
 					Key:   key,
