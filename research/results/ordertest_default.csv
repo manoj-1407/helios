@@ -1,0 +1,89 @@
+regime,phase,run,position,config,ops_per_sec,p50_ms,p99_ms,propose_failures
+[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-3932421383  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3331343797  mode=FORCE_LEVELED
+18082  data=/tmp/helios-bench-static_leveled-n2-1413133310  mode=FORCE_LEVELED
+default,same,1,1,static_leveled,2419,44.00,51.78,0
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3121404403  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-3320310854  mode=FORCE_LEVELED
+18082  data=/tmp/helios-bench-static_leveled-n2-3036734008  mode=FORCE_LEVELED
+default,same,2,2,static_leveled,2747,44.01,48.11,0
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-190670936  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-3933393848  mode=FORCE_LEVELED
+18082  data=/tmp/helios-bench-static_leveled-n2-1542899585  mode=FORCE_LEVELED
+default,same,3,3,static_leveled,2413,44.08,58.27,0
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-3642005485  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-1965545283  mode=FORCE_LEVELED
+18081  data=/tmp/helios-bench-static_leveled-n1-2405937346  mode=FORCE_LEVELED
+default,same,4,4,static_leveled,2710,44.00,52.98,0
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-695590895  mode=ADAPTIVE
+[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-2271720207  mode=ADAPTIVE
+[helios-kv] :18081  data=/tmp/helios-bench-adaptive_both-n1-571828276  mode=ADAPTIVE
+default,perms,5,1,adaptive_both,2906,44.11,51.64,0
+[helios-kv] :18080  data=/tmp/helios-bench-mismatched-n0-1565338983  mode=FORCE_LEVELED
+[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-2603838585  mode=FORCE_TIERED
+[helios-kv] :18082  data=/tmp/helios-bench-mismatched-n2-2360495888  mode=FORCE_TIERED
+default,perms,6,2,mismatched,2854,44.64,52.11,0
+[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-760732789  mode=FORCE_LEVELED
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-3690958833  mode=FORCE_LEVELED
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-720727767  mode=FORCE_LEVELED
+default,perms,7,3,static_leveled,2676,45.20,56.00,0
+[helios-kv] :18081  data=/tmp/helios-bench-adaptive_both-n1-4259216026  mode=ADAPTIVE
+[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-1782663744  mode=ADAPTIVE
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-147192937  mode=ADAPTIVE
+default,perms,8,1,adaptive_both,2451,44.07,51.60,0
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3212266876  mode=FORCE_LEVELED
+[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-3594998554  mode=FORCE_LEVELED
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-591594305  mode=FORCE_LEVELED
+default,perms,9,2,static_leveled,2905,46.10,52.11,0
+[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-2741446501  mode=FORCE_TIERED
+[helios-kv] :18080  data=/tmp/helios-bench-mismatched-n0-987338986  mode=FORCE_LEVELED
+[helios-kv] :18082  data=/tmp/helios-bench-mismatched-n2-1434515276  mode=FORCE_TIERED
+default,perms,10,3,mismatched,2486,44.32,51.45,0
+[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-48630222  mode=FORCE_TIERED
+[helios-kv] :18082  data=/tmp/helios-bench-mismatched-n2-3469640317  mode=FORCE_TIERED
+[helios-kv] :18080  data=/tmp/helios-bench-mismatched-n0-4195565468  mode=FORCE_LEVELED
+default,perms,11,1,mismatched,2382,44.28,52.19,0
+[helios-kv] :18081  data=/tmp/helios-bench-adaptive_both-n1-1557617466  mode=ADAPTIVE
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-2559573474  mode=ADAPTIVE
+[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-2606301997  mode=ADAPTIVE
+default,perms,12,2,adaptive_both,2594,44.12,51.95,0
+[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-128662201  mode=FORCE_LEVELED
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-4134259996  mode=FORCE_LEVELED
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3951986107  mode=FORCE_LEVELED
+default,perms,13,3,static_leveled,2648,43.95,51.79,0
+[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-646695311  mode=FORCE_TIERED
+[helios-kv] :[helios-kv] :18082  data=/tmp/helios-bench-mismatched-n2-846801883  mode=FORCE_TIERED
+18080  data=/tmp/helios-bench-mismatched-n0-1527649291  mode=FORCE_LEVELED
+default,perms,14,1,mismatched,2695,45.42,51.97,0
+[helios-kv] :18081  data=/tmp/helios-bench-static_leveled-n1-1107546798  mode=FORCE_LEVELED
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-2693538131  mode=FORCE_LEVELED
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-2470806084  mode=FORCE_LEVELED
+default,perms,15,2,static_leveled,2287,44.16,51.88,0
+[helios-kv] :[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-2386473658  mode=ADAPTIVE
+18081  data=/tmp/helios-bench-adaptive_both-n1-3013146418  mode=ADAPTIVE
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-2844906154  mode=ADAPTIVE
+default,perms,16,3,adaptive_both,2166,44.19,51.81,0
+[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-1441631454  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3586316774  mode=FORCE_LEVELED
+18081  data=/tmp/helios-bench-static_leveled-n1-385803541  mode=FORCE_LEVELED
+default,perms,17,1,static_leveled,2446,46.36,55.77,0
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-1311214563  mode=ADAPTIVE
+[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-1258300374  mode=ADAPTIVE
+[helios-kv] :18081  data=/tmp/helios-bench-adaptive_both-n1-3662064650  mode=ADAPTIVE
+default,perms,18,2,adaptive_both,2314,44.24,55.96,0
+[helios-kv] :18080  data=/tmp/helios-bench-mismatched-n0-415681728  mode=FORCE_LEVELED
+[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-2087547205  mode=FORCE_TIERED
+[helios-kv] :18082  data=/tmp/helios-bench-mismatched-n2-1995198853  mode=FORCE_TIERED
+default,perms,19,3,mismatched,2637,45.28,51.94,0
+[helios-kv] :18080  data=/tmp/helios-bench-static_leveled-n0-3329895107  mode=FORCE_LEVELED
+[helios-kv] :[helios-kv] :18082  data=/tmp/helios-bench-static_leveled-n2-1298945029  mode=FORCE_LEVELED
+18081  data=/tmp/helios-bench-static_leveled-n1-1711737056  mode=FORCE_LEVELED
+default,perms,20,1,static_leveled,2585,44.63,50.90,0
+[helios-kv] :[helios-kv] :18081  data=/tmp/helios-bench-mismatched-n1-3508089547  mode=FORCE_TIERED
+18082  data=/tmp/helios-bench-mismatched-n2-504987830  mode=FORCE_TIERED
+[helios-kv] :18080  data=/tmp/helios-bench-mismatched-n0-2502211331  mode=FORCE_LEVELED
+default,perms,21,2,mismatched,2685,45.59,52.31,0
+[helios-kv] :18082  data=/tmp/helios-bench-adaptive_both-n2-3344270810  mode=ADAPTIVE
+[helios-kv] :18080  data=/tmp/helios-bench-adaptive_both-n0-2962722485  mode=ADAPTIVE
+[helios-kv] :18081  data=/tmp/helios-bench-adaptive_both-n1-1310828901  mode=ADAPTIVE
+default,perms,22,3,adaptive_both,2552,44.07,53.96,0

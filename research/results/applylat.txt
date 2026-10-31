@@ -1,0 +1,12 @@
+== default1 ()
+n=400  put latency ms: p50=43.94 p90=44.12 p99=48.12 max=59.86
+== nodelay1 (-Dsun.net.httpserver.nodelay=true)
+n=400  put latency ms: p50=0.99 p90=3.02 p99=7.39 max=12.09
+== default2 ()
+n=400  put latency ms: p50=43.96 p90=44.16 p99=48.08 max=48.17
+== nodelay2 (-Dsun.net.httpserver.nodelay=true)
+n=400  put latency ms: p50=0.90 p90=2.16 p99=5.53 max=8.80
+== default3 ()
+n=400  put latency ms: p50=43.96 p90=44.12 p99=48.08 max=52.00
+== nodelay3 (-Dsun.net.httpserver.nodelay=true)
+n=400  put latency ms: p50=0.97 p90=2.44 p99=6.37 max=7.82
