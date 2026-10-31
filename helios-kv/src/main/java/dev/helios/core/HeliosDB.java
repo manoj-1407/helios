@@ -76,6 +76,7 @@ public final class HeliosDB implements AutoCloseable {
 
     private final AtomicLong logicalBytesWritten = new AtomicLong();
     private final AtomicLong physicalBytesFlushed = new AtomicLong();
+    private final AtomicLong flushesCompleted = new AtomicLong();
 
     public HeliosDB(Path dataDir) throws IOException {
         this(dataDir, 4 * 1024 * 1024, CompactionManager.Mode.ADAPTIVE);
@@ -295,6 +296,7 @@ public final class HeliosDB implements AutoCloseable {
                 SSTable flushed = sstableWriter.flush(toFlush.snapshot(), 0);
                 physicalBytesFlushed.addAndGet(Files.size(flushed.dataFile()));
                 sstables.add(flushed);
+                flushesCompleted.incrementAndGet();
                 flushing.remove(toFlush);
                 oldWal.close();
                 Files.deleteIfExists(oldWal.path());
@@ -334,6 +336,11 @@ public final class HeliosDB implements AutoCloseable {
     public long physicalBytesFlushed() {
         return physicalBytesFlushed.get() + compactionManager.physicalBytesWrittenByCompaction();
     }
+
+    public long flushesCompleted() { return flushesCompleted.get(); }
+    public long compactionsCompleted() { return compactionManager.compactionsCompleted(); }
+    public long compactionBusyNanos() { return compactionManager.compactionBusyNanos(); }
+    public long tablesCompacted() { return compactionManager.tablesCompacted(); }
 
     public String activeCompactionStrategy() {
         return compactionManager.activeStrategyName();

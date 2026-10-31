@@ -12,7 +12,7 @@ The headline: the committed benchmark cannot support the Helios thesis, in eithe
 | F1 | `/kv/put` and the bench report success when the leader has appended locally (`raft.go:750-775`). No client waits for commit. | read | "Throughput" is the leader's local append rate. |
 | F2 | `OpsPerSec` = ops / wall time until all `Propose` calls return (`bench/replication_bench.go`). Commit and apply are not in it. | read | Cannot show a compaction effect on replication. |
 | F3 | Every `/put` takes ~44 ms with the default JVM HTTP server and ~1 ms with `-Dsun.net.httpserver.nodelay=true`. Same JVM, same jar, 400 sequential applies, 3 repetitions each: p50 43.94 / 43.96 / 43.96 ms versus 0.99 / 0.90 / 0.97 ms. | **reproduced** | The bench's "P50ApplyLagNs" (about 52 ms in `thesis.json`) is mostly this stall. It is the same for every config, so it hides any real difference. Cause is consistent with Nagle plus delayed ACK on the header/body split; I did not capture packets to prove it. |
-| F4 | The workload is 200 keys at a 64 KiB memtable. `thesis.json` shows `CompactionSwitches: 0` for all configs and the repo's own README says no merge ran. | read, and the repo's own result | No compaction was demonstrated in any config. Not independently confirmed here because the JVM counter that would show it is broken (F6). |
+| F4 | The workload is 200 keys at a 64 KiB memtable. Using the new JVM counters (below): 40,000 puts over 200 keys produce **0 flushes, 0 sstables, 0 compactions**; the same 40,000 puts over 100,000 keys produce 8 flushes and 3 compactions. | **reproduced** | The bench's key space never triggers compaction in any config. Any difference between configs in `thesis.json` cannot be a compaction effect. Overwrites to the same 200 keys stay inside the memtable. I do not know what produced the 0.37 to 0.41 write amplification in `thesis.json` (my 200-key run reports 0.0 before a forced flush); I have not tried to explain it. |
 | F5 | The bench kills the JVMs when `Run` returns, without waiting for `LastApplied == CommitIndex`. | read | Write amplification and apply counts are taken mid-drain. |
 | F6 | `compaction_events` increments only if the strategy name differs across two reads inside one `/put` handler (`HeliosServer.java:84-88`). Strategy changes happen on the 2 s compaction tick. | read | The metric is effectively always 0. It is not evidence that nothing compacted. |
 | F7 | Modes are assigned by node index (`bridges[i]`), but the leader is whichever node wins the election, and `BenchCluster.Leader()` iterates a map. "Leader=LEVELED, follower=TIERED" is not guaranteed by the harness. | read | The `mismatched` label is not a controlled condition. |
@@ -64,3 +64,16 @@ Commit `41e9faf` plus a harness change that records, per write on the leader's c
 What this says: with this harness the three configs are indistinguishable on commit latency and throughput. That is expected, not informative, because compaction is still not shown to run (F4, F6). It is not a negative result for the thesis.
 
 What it does not say: the harness is closed-loop with 32 workers, so latencies include queueing among the clients themselves and are subject to coordinated omission. The ack p99 of ~24 ms is much larger than one fsync on this disk should cost; my guess is that 32 proposers serialize on `r.mu` while the leader fsyncs under the lock (F13). That is a hypothesis; no experiment here isolates it. The next harness step is open-loop arrivals at a fixed fraction of measured capacity (M3 in `EXPERIMENT_DESIGN.md`) and a compaction counter that works (M5), so that "compaction happened" is verified before any comparison.
+
+## Round 3: counters that work, and a direct compaction check
+
+Added to the JVM: completed flushes, completed compactions, tables compacted, and compaction busy time. They are exposed on `/stats` (new JSON fields) and `/metrics` (`helios_flushes_total`, `helios_compactions_total`, `helios_compaction_busy_seconds_total`). Unlike `compaction_events` (F6), they count real work.
+
+Single JVM, `FORCE_LEVELED`, 64 KiB memtable, 40,000 sequential puts through the Go bridge, stats read 3 s after the last put. One run per row, so this is an existence check, not a measurement.
+
+| keys | flushes | compactions | sstables at end | write amplification |
+|---|---|---|---|---|
+| 200 (the bench's) | 0 | 0 | 0 | 0.00 |
+| 100,000 | 8 | 3 | 2 | 5.07 |
+
+So the minimum change that lets the benchmark exercise compaction at all is a larger key space (and values big enough to fill the memtable). Raw output: `results/compaction_check.txt`. The 3 compactions at 100,000 keys busy the engine for about 1 ms in total on this host, which is far too little to matter for replication; a meaningful compaction workload needs larger values or many more writes. That is the next calibration step, not a result.

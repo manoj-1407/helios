@@ -160,8 +160,10 @@ public final class HeliosServer {
         String prev = lastStrategy.getAndSet(strategy);
         boolean changed = !strategy.equals(prev);
         String body = String.format(
-            "{\"write_amplification\":%.4f,\"sstable_count\":%d,\"compaction_events\":%d,\"strategy\":\"%s\",\"strategy_changed\":%b}",
-            db.writeAmplification(), db.sstableCount(), compactionEvents.get(), strategy, changed
+            "{\"write_amplification\":%.4f,\"sstable_count\":%d,\"compaction_events\":%d,\"strategy\":\"%s\",\"strategy_changed\":%b,"
+            + "\"flushes\":%d,\"compactions\":%d,\"tables_compacted\":%d,\"compaction_busy_ms\":%d}",
+            db.writeAmplification(), db.sstableCount(), compactionEvents.get(), strategy, changed,
+            db.flushesCompleted(), db.compactionsCompleted(), db.tablesCompacted(), db.compactionBusyNanos() / 1_000_000
         );
         respond(ex, 200, body);
     }
@@ -305,6 +307,12 @@ public final class HeliosServer {
         metric(sb, "helios_physical_bytes_flushed_total",
                "Bytes written to disk including flush and compaction rewrites",
                "counter", String.valueOf(physical), null, null);
+        metric(sb, "helios_flushes_total", "Completed background memtable flushes",
+               "counter", String.valueOf(db.flushesCompleted()), null, null);
+        metric(sb, "helios_compactions_total", "Completed compaction runs (real merges, unlike compaction_events)",
+               "counter", String.valueOf(db.compactionsCompleted()), null, null);
+        metric(sb, "helios_compaction_busy_seconds_total", "Wall time spent applying compaction plans",
+               "counter", String.format("%.3f", db.compactionBusyNanos() / 1e9), null, null);
         // info-style metric: always value=1, carries the strategy as a label
         metric(sb, "helios_active_strategy_info",
                "Active compaction strategy (leveled / tiered / adaptive)",

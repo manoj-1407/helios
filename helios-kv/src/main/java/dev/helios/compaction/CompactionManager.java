@@ -50,6 +50,10 @@ public final class CompactionManager {
 
     private volatile CompactionStrategy active;
     private final AtomicLong physicalBytesWrittenByCompaction = new AtomicLong();
+    // real work counters (audit finding F6: the old strategy-switch counter was effectively always 0)
+    private final AtomicLong compactionsCompleted = new AtomicLong();
+    private final AtomicLong compactionBusyNanos = new AtomicLong();
+    private final AtomicLong tablesCompacted = new AtomicLong();
     private final List<String> switchLog = new CopyOnWriteArrayList<>();
 
     public CompactionManager(WorkloadClassifier classifier,
@@ -105,6 +109,7 @@ public final class CompactionManager {
             CompactionPlan plan = active.plan(snapshot);
             if (plan.isNoop()) return;
 
+            long busyStart = System.nanoTime();
             sstables.addAll(plan.toAdd());     // publish new tables first (see class doc)
             sstables.removeAll(plan.toRemove()); // then retire old references
             for (SSTable added : plan.toAdd()) {
@@ -119,6 +124,9 @@ public final class CompactionManager {
             for (SSTable removed : plan.toRemove()) {
                 removed.release();
             }
+            compactionsCompleted.incrementAndGet();
+            tablesCompacted.addAndGet(plan.toRemove().size());
+            compactionBusyNanos.addAndGet(System.nanoTime() - busyStart);
         } catch (IOException e) {
             System.err.println("[helios-kv] compaction tick failed (will retry next tick): " + e);
         } catch (Throwable t) {
@@ -139,6 +147,10 @@ public final class CompactionManager {
     public long physicalBytesWrittenByCompaction() {
         return physicalBytesWrittenByCompaction.get();
     }
+
+    public long compactionsCompleted() { return compactionsCompleted.get(); }
+    public long compactionBusyNanos() { return compactionBusyNanos.get(); }
+    public long tablesCompacted() { return tablesCompacted.get(); }
 
     public List<String> switchLog() {
         return switchLog;

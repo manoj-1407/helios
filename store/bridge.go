@@ -20,6 +20,10 @@ type StatsSnapshot struct {
 	CompactionEvents   int64   `json:"compaction_events"`
 	Strategy           string  `json:"strategy"`
 	StrategyChanged    bool    `json:"strategy_changed"`
+	Flushes            int64   `json:"flushes"`
+	Compactions        int64   `json:"compactions"`
+	TablesCompacted    int64   `json:"tables_compacted"`
+	CompactionBusyMs   int64   `json:"compaction_busy_ms"`
 }
 
 type DataPoint struct {
