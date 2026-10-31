@@ -38,6 +38,15 @@ type BenchResult struct {
 	CompactionSwitches int64
 	LagAfterCompaction []int64
 	ApplyErrors        int64
+
+	// measured on the leader's clock per write: ack = Propose call to return
+	// (local append, what OpsPerSec used to be built on), commit = Propose call
+	// to CommitIndex >= index (majority has the entry). Failed or timed-out
+	// writes are excluded and counted in CommitTimeouts.
+	AckP99Ns       int64
+	CommitP50Ns    int64
+	CommitP99Ns    int64
+	CommitTimeouts int64
 }
 
 func (r BenchResult) Print() {
@@ -45,6 +54,7 @@ func (r BenchResult) Print() {
 	fmt.Printf("  leader=%-10s  follower=%s\n", r.Config.LeaderMode, r.Config.FollowerMode)
 	fmt.Printf("  ops=%d  duration=%dms  ops/sec=%.0f\n", r.Ops, r.DurationMs, r.OpsPerSec)
 	fmt.Printf("  apply_lag  p50=%dns  p99=%dns  max=%dns\n", r.P50ApplyLagNs, r.P99ApplyLagNs, r.MaxApplyLagNs)
+	fmt.Printf("  commit_latency p50=%dns p99=%dns  ack p99=%dns  commit_timeouts=%d\n", r.CommitP50Ns, r.CommitP99Ns, r.AckP99Ns, r.CommitTimeouts)
 	fmt.Printf("  write_amplification=%.4fx\n", r.WriteAmplification)
 	fmt.Printf("  compaction_switches=%d  apply_errors=%d\n", r.CompactionSwitches, r.ApplyErrors)
 	if len(r.LagAfterCompaction) > 0 {
@@ -135,6 +145,9 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 	var wg sync.WaitGroup
 	var errCount int64
 	var errMu sync.Mutex
+	var latMu sync.Mutex
+	var ackLat, commitLat []int64
+	var commitTimeouts int64
 	sem := make(chan struct{}, 32)
 
 	for i := 0; i < ops; i++ {
@@ -161,12 +174,32 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 					errMu.Unlock()
 					return
 				}
-				_, _, ok := leader.Propose(cmd)
+				t0 := time.Now()
+				idx, _, ok := leader.Propose(cmd)
+				t1 := time.Now()
 				if !ok {
 					errMu.Lock()
 					errCount++
 					errMu.Unlock()
+					return
 				}
+				// wait for commit on the leader. polling at 100us bounds the
+				// measurement error well under the ms-scale latencies of interest.
+				deadline := t0.Add(2 * time.Second)
+				for leader.CommitIndex() < idx {
+					if time.Now().After(deadline) {
+						latMu.Lock()
+						commitTimeouts++
+						latMu.Unlock()
+						return
+					}
+					time.Sleep(100 * time.Microsecond)
+				}
+				t3 := time.Now()
+				latMu.Lock()
+				ackLat = append(ackLat, t1.Sub(t0).Nanoseconds())
+				commitLat = append(commitLat, t3.Sub(t0).Nanoseconds())
+				latMu.Unlock()
 			} else {
 				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 				defer cancel()
@@ -213,6 +246,14 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 		CompactionSwitches: totalCompactionSwitches,
 		LagAfterCompaction: lagAfterCompaction,
 		ApplyErrors:        errCount,
+	}
+	sort.Slice(ackLat, func(i, j int) bool { return ackLat[i] < ackLat[j] })
+	sort.Slice(commitLat, func(i, j int) bool { return commitLat[i] < commitLat[j] })
+	result.CommitTimeouts = commitTimeouts
+	if len(commitLat) > 0 {
+		result.AckP99Ns = percentile(ackLat, 99)
+		result.CommitP50Ns = percentile(commitLat, 50)
+		result.CommitP99Ns = percentile(commitLat, 99)
 	}
 	if len(allLags) > 0 {
 		result.P50ApplyLagNs = percentile(allLags, 50)

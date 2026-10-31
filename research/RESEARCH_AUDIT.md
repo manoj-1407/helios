@@ -49,3 +49,18 @@ The assignment brief quotes 303, 714 and 721 ops/s. The committed `bench/results
 It shows the benchmark is invalid for the thesis. It does not show that compaction mismatch has no effect on replication; no valid experiment of that has been run yet. `HYPOTHESES.md` has the replacement hypotheses and `EXPERIMENT_DESIGN.md` has the experiments that would test them.
 
 Raw data: `research/results/` (`applylat.txt`, `ordertest_default.csv`, `ordertest_nodelay.csv`, and the `clean_*.csv` versions with the JVM log lines removed from stdout).
+
+## Round 2: first commit-latency numbers (nodelay server, per-op rng)
+
+Commit `41e9faf` plus a harness change that records, per write on the leader's clock, ack latency (Propose call to return) and commit latency (Propose call to `CommitIndex >= index`, polled every 100 us). Same host as above. 24 runs of 4,000 ops at 90% writes: six identical `static_leveled` runs, then all six orderings of the three configs. Raw data: `results/commit_latency_v1.csv`. Zero proposal failures and zero commit timeouts.
+
+| measure | six identical runs | across configs (means) |
+|---|---|---|
+| ops/s | 1248 to 1412, CV 5% | adaptive 1314, mismatched 1300, static 1346 |
+| commit p50 ms | 8.0 to 14.3, CV 20% | 10.1, 10.8, 10.1 |
+| commit p99 ms | 30.7 to 34.1, CV 4% | 38.3, 35.7, 34.9 |
+| ack p99 ms | 21.4 to 25.6, CV 6% | not broken out |
+
+What this says: with this harness the three configs are indistinguishable on commit latency and throughput. That is expected, not informative, because compaction is still not shown to run (F4, F6). It is not a negative result for the thesis.
+
+What it does not say: the harness is closed-loop with 32 workers, so latencies include queueing among the clients themselves and are subject to coordinated omission. The ack p99 of ~24 ms is much larger than one fsync on this disk should cost; my guess is that 32 proposers serialize on `r.mu` while the leader fsyncs under the lock (F13). That is a hypothesis; no experiment here isolates it. The next harness step is open-loop arrivals at a fixed fraction of measured capacity (M3 in `EXPERIMENT_DESIGN.md`) and a compaction counter that works (M5), so that "compaction happened" is verified before any comparison.

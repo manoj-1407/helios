@@ -26,7 +26,7 @@ func main() {
 	regime := flag.String("regime", "unset", "label written to the CSV (e.g. default or nodelay)")
 	flag.Parse()
 
-	fmt.Println("regime,phase,run,position,config,ops_per_sec,p50_ms,p99_ms,propose_failures")
+	fmt.Println("regime,phase,run,position,config,ops_per_sec,p50_ms,p99_ms,propose_failures,commit_p50_ms,commit_p99_ms,ack_p99_ms,commit_timeouts")
 	run := 0
 	emit := func(phase string, pos int, cfg bench.CompactionConfig) {
 		r, err := bench.Run(cfg, *ops, 0.9)
@@ -35,8 +35,9 @@ func main() {
 			os.Exit(1)
 		}
 		run++
-		fmt.Printf("%s,%s,%d,%d,%s,%.0f,%.2f,%.2f,%d\n", *regime, phase, run, pos, cfg.Name,
-			r.OpsPerSec, float64(r.P50ApplyLagNs)/1e6, float64(r.P99ApplyLagNs)/1e6, r.ApplyErrors)
+		fmt.Printf("%s,%s,%d,%d,%s,%.0f,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%d\n", *regime, phase, run, pos, cfg.Name,
+			r.OpsPerSec, float64(r.P50ApplyLagNs)/1e6, float64(r.P99ApplyLagNs)/1e6, r.ApplyErrors,
+			float64(r.CommitP50Ns)/1e6, float64(r.CommitP99Ns)/1e6, float64(r.AckP99Ns)/1e6, r.CommitTimeouts)
 		fmt.Fprintf(os.Stderr, "[%s] %s run %d done\n", *regime, phase, run)
 		time.Sleep(5 * time.Second)
 	}
