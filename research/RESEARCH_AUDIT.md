@@ -77,3 +77,12 @@ Single JVM, `FORCE_LEVELED`, 64 KiB memtable, 40,000 sequential puts through the
 | 100,000 | 8 | 3 | 2 | 5.07 |
 
 So the minimum change that lets the benchmark exercise compaction at all is a larger key space (and values big enough to fill the memtable). Raw output: `results/compaction_check.txt`. The 3 compactions at 100,000 keys busy the engine for about 1 ms in total on this host, which is far too little to matter for replication; a meaningful compaction workload needs larger values or many more writes. That is the next calibration step, not a result.
+
+## Round 4: tracked jar, tests, race detector, commit semantics
+
+* The tracked `helios-kv/helios-kv.jar` is replaced with a jar built from the current source with `Main-Class: dev.helios.Main` (built with `javac` and `jar`, because Maven plugins could not be resolved from this host; it carries no Maven metadata). `go run ./cmd/bench` now starts from the tracked jar with no extra build step. Committing a binary is still a bad idea (F11 in the roadmap); this is the minimum that makes a fresh clone runnable.
+* `go test` and `go test -race` pass for `raft` and `chaos`. `store`, `client` and `bench` have no tests, so the per-op rng change (F15) is covered only by the next item.
+* `go run -race ./cmd/bench -ops 2000` ran all three configs with the new jar: 0 data-race reports, 0 failed proposals, 0 commit timeouts. One run per config, so this checks for races and launch, not performance.
+* New test `raft/commit_semantics_test.go`: for 200 proposals on a 3-node in-process cluster, at the instant `leader.CommitIndex() >= idx`, at least 2 of 3 nodes hold the same term and command at `idx`. Passes under `-race` three times. This supports using that condition as the commit time (t3) in the bench. It does not cover leader changes or crashes.
+
+Still open from this round: the unexplained 0.37 to 0.41 write amplification in `thesis.json`. The fresh bench runs above report 0.71 to 0.75 with the same code path, which is a different number again, so the definition and the moment of measurement (F5) need to be pinned down before write amplification is used anywhere.
