@@ -337,6 +337,10 @@ public final class HeliosDB implements AutoCloseable {
         return physicalBytesFlushed.get() + compactionManager.physicalBytesWrittenByCompaction();
     }
 
+    /** bytes of SSTable data files written by memtable flushes only (no compaction output) */
+    public long flushBytes() { return physicalBytesFlushed.get(); }
+    /** bytes of SSTable data files written as compaction output only (inputs read are not counted) */
+    public long compactionBytes() { return compactionManager.physicalBytesWrittenByCompaction(); }
     public long flushesCompleted() { return flushesCompleted.get(); }
     public long compactionsCompleted() { return compactionManager.compactionsCompleted(); }
     public long compactionBusyNanos() { return compactionManager.compactionBusyNanos(); }

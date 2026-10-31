@@ -106,10 +106,10 @@ public final class CompactionManager {
             List<SSTable> snapshot = new ArrayList<>(sstables);
             if (snapshot.size() < 2) return;
 
+            long busyStart = System.nanoTime(); // merge work happens inside plan(), so time from here
             CompactionPlan plan = active.plan(snapshot);
             if (plan.isNoop()) return;
 
-            long busyStart = System.nanoTime();
             sstables.addAll(plan.toAdd());     // publish new tables first (see class doc)
             sstables.removeAll(plan.toRemove()); // then retire old references
             for (SSTable added : plan.toAdd()) {

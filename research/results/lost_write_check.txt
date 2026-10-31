@@ -1,0 +1,10 @@
+-- run 1
+VERIFY: acknowledged=19785 missing=0 wrong_value=0 failed_puts=215
+WARNING: 215 failed puts; first: after 0.3s: status 500
+-- run 2
+VERIFY: acknowledged=19782 missing=0 wrong_value=0 failed_puts=218
+WARNING: 218 failed puts; first: after 0.4s: status 500
+-- conc=1
+VERIFY: acknowledged=20000 missing=0 wrong_value=0 failed_puts=0
+-- conc=8
+VERIFY: acknowledged=18798 missing=0 wrong_value=0 failed_puts=1202

@@ -86,3 +86,41 @@ So the minimum change that lets the benchmark exercise compaction at all is a la
 * New test `raft/commit_semantics_test.go`: for 200 proposals on a 3-node in-process cluster, at the instant `leader.CommitIndex() >= idx`, at least 2 of 3 nodes hold the same term and command at `idx`. Passes under `-race` three times. This supports using that condition as the commit time (t3) in the bench. It does not cover leader changes or crashes.
 
 Still open from this round: the unexplained 0.37 to 0.41 write amplification in `thesis.json`. The fresh bench runs above report 0.71 to 0.75 with the same code path, which is a different number again, so the definition and the moment of measurement (F5) need to be pinned down before write amplification is used anywhere.
+
+## Round 5: compaction calibration, write amplification, two more findings
+
+### New findings
+
+| id | finding | status |
+|---|---|---|
+| F16 | `LeveledCompaction` and `TieredCompaction` are the same algorithm: both call `CompactionMerge.mergeAll` on every live table and write one output table. They differ only in the trigger (3 tables versus 6, `BASE_TRIGGER_TABLE_COUNT`). Compaction is checked on a 2 s tick, and a flush can happen every few tens of ms, so dozens of tables are waiting at each tick and both trigger every time. There are no levels and no size tiers. "Leveled versus tiered versus adaptive" is therefore "compact at 3 tables versus 6", and in the data below the two are indistinguishable. | **read** (both `plan()` methods) and **reproduced** (identical results, below) |
+| F17 | Concurrent writers to one helios-kv JVM race with memtable rotation. `HeliosDB.writeInternal` reads `wal` and `active` with no lock; a writer can hold the old WAL while the flush thread closes it, and `WAL.append` throws `ClosedChannelException` (stack trace captured). The JDK HTTP server then drops the connection with no response, so clients see `EOF`. Unique-key runs, one writer: 0 of 20,000 puts failed. Eight writers: 1,202 of 20,000 (6%). Four writers: about 1.1% (2 runs). | **reproduced**, `results/lost_write_check.txt` |
+
+F17 is scoped. The Raft apply path is one serial writer per node, so the Raft benchmark should not hit it, and I did not change the engine. Any multi-client use of the helios-kv HTTP API does hit it. I tested for the worse variant, silent loss of an acknowledged write: unique keys, every acknowledged put read back after the run. 0 missing and 0 wrong values across 4 runs (about 19,800 acknowledged writes in the 4-writer runs and 18,798 in the 8-writer run). That does not support silent loss in this test; it does not rule it out, and crash durability was not tested. The put handler now catches the exception and answers 500 (previously the connection was dropped), so the failure is visible.
+
+### Write amplification: what it is
+
+`HeliosDB.writeAmplification()` = (bytes of SSTable data files written by flushes + bytes of SSTable data files written as compaction output) / (key + value bytes passed to `put`). It excludes the WAL, excludes bytes read by compaction, and counters live for the JVM's lifetime and never reset. It returns 1.0 when nothing has been written. A value below 1.0 means overwrites collapsed in the memtable, not that the engine amplifies less. `/stats` now also returns `logical_bytes`, `flush_bytes` and `compaction_bytes` separately.
+
+In the bench, the 200-key workload never flushes on its own (F4); the only flush is the final `?flush=1` call, so the numerator is one small table and the denominator is whatever had been applied when it ran. Checked at three sizes with the fixed bench: 2,000 ops gave 0.71 to 0.75 for the three configs; 8,000 ops gave 0.42, 0.21 and 0.19. That is consistent with "roughly constant flush size over applied logical bytes", and with the 0.37 to 0.41 in `thesis.json` being a snapshot taken at an arbitrary point in the apply backlog (F5). It is not proven, and the 0.42 (adaptive) against 0.19 to 0.21 at the same ops is unexplained. Conclusion: do not use bench write amplification at all; use the engine-only numbers below.
+
+### Calibration: a workload that compacts
+
+Engine only (no Raft), single JVM, 64 KiB memtable, 100,000 puts, **one writer** (matches the Raft apply path), uniform keys, one run per cell. Criteria fixed before looking: zero failed puts, at least 10 completed compactions, and compaction busy time measurable against run time. `results/calibration_v2.csv`.
+
+| mode | keys | value B | run s | flushes | compactions | busy ms | compaction MB | logical MB | write amp |
+|---|---|---|---|---|---|---|---|---|---|
+| leveled | 10,000 | 100 | 41.3 | 164 | 21 | 940 | 23 | 11 | 3.18 |
+| leveled | 10,000 | 1000 | 47.9 | 1533 | 24 | 1676 | 219 | 101 | 3.17 |
+| leveled | 100,000 | 100 | 42.4 | 168 | 19 | 2888 | 88 | 11 | 9.01 |
+| leveled | 100,000 | 1000 | 47.0 | 1537 | 22 | 4936 | 812 | 101 | 9.05 |
+| tiered | 10,000 | 100 | 40.7 | 164 | 19 | 956 | 22 | 11 | 3.03 |
+| tiered | 10,000 | 1000 | 45.8 | 1533 | 23 | 1640 | 210 | 101 | 3.08 |
+| tiered | 100,000 | 100 | 43.1 | 168 | 19 | 2901 | 87 | 11 | 8.93 |
+| tiered | 100,000 | 1000 | 45.4 | 1537 | 21 | 4738 | 775 | 101 | 8.68 |
+
+What it shows: all eight cells compact repeatedly, and write amplification comes from compaction (flush-only amplification is 1.01 to 1.11), growing with key count because each compaction rewrites the whole data set (F16). Compaction occupies roughly 2% to 10% of wall time in bursts that grow as data accumulates. Leveled and tiered differ by less than the cell-to-cell spread I would expect from noise, which matches F16; I have one run per cell, so no variance estimate.
+
+What it does not show: any effect on replication. This is engine-only. The compaction duty cycle is small, so a compaction effect on commit latency may be small too. The quorum-masking experiment should not depend on compaction to create slowness; it injects fsync delay directly.
+
+The raw run with 4 concurrent writers (`results/calibration_v1.csv`) is kept for the F17 evidence; its numbers include failed puts and should not be used for anything else (its `busy_ms` also excluded merge time, since fixed).

@@ -87,7 +87,16 @@ public final class HeliosServer {
         String key = raw.substring(0, nl);
         String val = raw.substring(nl + 1);
         String prevStrategy = db.activeCompactionStrategy();
-        db.put(key.getBytes(StandardCharsets.UTF_8), val.getBytes(StandardCharsets.UTF_8));
+        try {
+            db.put(key.getBytes(StandardCharsets.UTF_8), val.getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            // the JDK http server closes the connection silently when a handler throws,
+            // which clients see as EOF. report it and answer 500 so it is visible.
+            System.err.println("[helios-kv] put failed: " + t);
+            t.printStackTrace();
+            respond(ex, 500, "put failed: " + t);
+            return;
+        }
         String newStrategy = db.activeCompactionStrategy();
         if (!prevStrategy.equals(newStrategy)) compactionEvents.incrementAndGet();
         respond(ex, 200, "ok");
@@ -161,9 +170,11 @@ public final class HeliosServer {
         boolean changed = !strategy.equals(prev);
         String body = String.format(
             "{\"write_amplification\":%.4f,\"sstable_count\":%d,\"compaction_events\":%d,\"strategy\":\"%s\",\"strategy_changed\":%b,"
-            + "\"flushes\":%d,\"compactions\":%d,\"tables_compacted\":%d,\"compaction_busy_ms\":%d}",
+            + "\"flushes\":%d,\"compactions\":%d,\"tables_compacted\":%d,\"compaction_busy_ms\":%d,"
+            + "\"logical_bytes\":%d,\"flush_bytes\":%d,\"compaction_bytes\":%d}",
             db.writeAmplification(), db.sstableCount(), compactionEvents.get(), strategy, changed,
-            db.flushesCompleted(), db.compactionsCompleted(), db.tablesCompacted(), db.compactionBusyNanos() / 1_000_000
+            db.flushesCompleted(), db.compactionsCompleted(), db.tablesCompacted(), db.compactionBusyNanos() / 1_000_000,
+            db.logicalBytesWritten(), db.flushBytes(), db.compactionBytes()
         );
         respond(ex, 200, body);
     }
