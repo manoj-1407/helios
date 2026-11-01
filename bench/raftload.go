@@ -158,7 +158,7 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		roles[r].SetFsyncDelay(d)
 	}
 	for r, s := range spec.Stall {
-		roles[r].SetFsyncStall(s.P, s.D, uint64(spec.Seed)*7919+uint64(len(r)))
+		roles[r].SetFsyncStall(s.P, s.D, uint64(spec.Seed)*7919+roleSeed(r))
 	}
 	// baseline for "changes during the run": counters already include the first election
 	base := map[string]raft.Instr{}
@@ -397,4 +397,16 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		res.PreVotes += in.PreVotesStarted - b.PreVotesStarted
 	}
 	return res, nil
+}
+
+// roleSeed derives a per-role stall seed from the role name. an earlier version used
+// len(role), which gave F1 and F2 the same seed and therefore identical stall
+// sequences (research/RESEARCH_AUDIT.md, stage 4b); fnv-1a keeps roles distinct.
+func roleSeed(role string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(role); i++ {
+		h ^= uint64(role[i])
+		h *= 1099511628211
+	}
+	return h
 }

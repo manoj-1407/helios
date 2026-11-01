@@ -36,7 +36,7 @@ for lab, rs in cells.items():
         okc = weak = 0
         for r in ok:
             good = wk = True
-            for part in d.split(","):
+            for part in d.replace(";", ",").split(","):
                 role, dur = part.split("="); ms = float(dur.rstrip("ms"))
                 syncs, inj = f(r, role + "_syncs"), f(r, role + "_injected_ms")
                 if not (syncs > 0 and inj >= 0.9 * ms * syncs - 1 and inj <= ms * syncs + 1): good = False

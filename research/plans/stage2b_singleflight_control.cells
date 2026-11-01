@@ -1,0 +1,6 @@
+# stage 2b: same-file controls for stage 2a. stage 2a had only the single-flight-on controls, and on_none_2000 showed
+# elections and failed proposals that the stage 2 baseline (off) did not. is that the option, or the host?
+off_none_500   500   1 -  -  0
+on_none_500    500   1 -  -  1
+off_none_2000  2000  1 -  -  0
+on_none_2000   2000  1 -  -  1

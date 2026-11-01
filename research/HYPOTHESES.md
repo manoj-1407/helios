@@ -56,3 +56,10 @@ Nothing here is measured. It needs cloud price and throttling data from provider
 ## Ordering
 
 H1 is cheapest and decides whether anything downstream is interesting: if followers are not masked, the whole model changes. H2 is the most novel candidate if it holds and also the easiest to get scooped on, so check LSM-Raft first. H3 is a measurement study and is useful even if it is negative. H4 only makes sense after H3 shows a real backlog problem.
+
+
+## Status after the load and timeout experiments (2026-11-01)
+
+* H1 (quorum masking): holds at low load for follower delays from 25 to 400 ms (commit p50 unchanged, no elections). It fails at 2,000 writes/s for any follower delay of 25 ms or more on this implementation because replication has no in-flight limit (resource exhaustion, not quorum arithmetic); a one-in-flight-per-peer option restores masking (stage 2a, 2b). Details in `RESEARCH_AUDIT.md`, Round 8b.
+* New H6 (storage-induced leadership loss under load): a leader with fsync delay far below the election timeout loses leadership near its fsync-limited capacity. Supported by stage 5 (about 1 election per run at rho 1.0, none at rho 0.9 and below, delays 10 and 25 ms). Mechanism evidence is correlational. Falsifier and next test: move fsync off `r.mu` (or heartbeats off the lock) and repeat at rho 0.5, 0.9, 1.0, 1.2 with 10 repetitions; the hypothesis is dropped if elections at rho 1.0 do not fall markedly. Not yet searched against the literature.
+* H2 to H4 (compaction synchronization, backlog, feedback control) are untouched by these experiments.

@@ -149,7 +149,7 @@ func main() {
 				enf = 1
 			}
 			fmt.Printf("%d,%d,%s,%.0f,%d,%d,%s,%s,%.0f,%s,%s,%d,%d,%d,%.2f,%d,%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.4f,%d,%d,%d,%d,%d",
-				rep, pos+1, c.label, c.rate, enf, sfi, c.dtxt, c.stxt, dur.Seconds(), r.LeaderStart, r.LeaderEnd,
+				rep, pos+1, c.label, c.rate, enf, sfi, strings.ReplaceAll(c.dtxt, ",", ";"), strings.ReplaceAll(c.stxt, ",", ";"), dur.Seconds(), r.LeaderStart, r.LeaderEnd,
 				r.Offered, r.Issued, r.Dropped, ms(r.GenSlipMaxNs), r.Measured, r.Failed, r.Lost, r.Unfinished, r.AchievedPerSec,
 				ms(r.AckP50Ns), ms(r.AckP99Ns), ms(r.CommitP50Ns), ms(r.CommitP95Ns), ms(r.CommitP99Ns), ms(r.CommitMaxNs),
 				r.MaxInFlight, r.NoLeaderFrac, r.TermStart, r.TermEnd, r.LeaderChanges, r.Elections, r.PreVotes)

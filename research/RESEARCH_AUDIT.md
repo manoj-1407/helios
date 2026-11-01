@@ -230,3 +230,108 @@ The first version of the Raft-only load generator read commit index, term and le
 ### Stage 0: capacity of the Raft-only leader (no delay)
 
 `research/plans/stage0_capacity.cells`, three runs per rate, 12 s each, `results/raftload_stage0_capacity.csv`. Commit p50 stays at 1.1 to 1.5 ms up to 2,000 writes/s with a p99 that grows from about 5 ms (200/s) to 11 to 22 ms (2,000/s). At 4,000 offered the leader achieves about 3,000 writes/s and commit latency is in the seconds (a queue is growing). At 8,000 and 16,000 offered, achieved throughput falls to about 1,000 to 2,200 writes/s, lower than at 4,000: past saturation the implementation loses throughput, probably from its unbounded one-goroutine-per-peer-per-proposal replication and the generator's own cost on 2 vCPUs. I did not isolate that. Load levels for later stages were fixed from this table before any delay results existed: 500 (low), 2,000 (near the knee), 3,000 (past it) writes/s.
+
+## Round 8b: the load and timeout experiments (stages 1 to 6, 4b, 4c, 2b)
+
+Everything below uses the Raft-only open-loop runner (`bench/raftload.go`, driver `research/cmd/raftload`, one process per run via `research/run_plan.py`), 3 in-process nodes, `ChannelTransport` with deadlines enforced (100 ms RPC timeout) unless a cell says otherwise, pure writes, 20 s runs with a 4 s warmup, 10 repetitions per cell in seeded randomized blocks, same 2-vCPU host, no other load. Delays are injected inside `RaftLog.Append`; every run records fsync count, injected time and longest sync per node. Injection check over the 387 ok runs that had a constant delay: in all 387 some delay was injected and a sync at least as long as the delay was observed (the weak check); in 365 the injected total was also within 10% of syncs times delay (the strict check). The 22 strict misses are 18 runs in stage 1's slow-follower cells, which were collected before the fix that reads counters before cleanup, and 4 single runs elsewhere; I did not diagnose them individually, and they do not change which runs had a delay. The Raft-only runner reads state through lock-free mirrors (Round 8a), so stalled nodes cannot hide their own stall from the observer. Raw data and cell definitions: `research/results/raftload_stage*.csv`, `research/plans/*.cells`. Stage 6's prediction was written into its plan file before any stage 6 run; the other stages were designed from stages before them. Load levels were fixed from the stage 0 capacity table before any delay results existed.
+
+Definitions that matter for reading the tables. *Commit latency* is measured from each arrival's intended send time to `CommitIndex >= idx` on the leader, after the entry is confirmed to be the one that committed there. *Lost* is an acknowledged write for which a different entry committed at its index (a deposed leader's tail); lost writes are excluded from latency. *Failed* is a refused proposal (not leader / append error). *Elections* counts election starts after pre-vote across the three nodes. `crashed(-9)` is an OOM kill of the run process; *aborted* means the run was stopped by the 3000 MB heap guard.
+
+### Baseline noise
+
+In the 155 no-fault runs at 2,000 writes/s or less, 6 runs (3.9%) contained at least one election (9 elections in total). So 1 to 3 elections in a 10-run cell is baseline, not an effect. I use only cells far above that rate below. I could not find the cause of these baseline elections; a 2-vCPU host running three Raft nodes and the load generator is the obvious suspect and I did not isolate it.
+
+### H-A: one slow follower under load (stages 1, 2, 2a, 2b, 6)
+
+Expected from the quorum model: with a fast quorum available, a slow follower does not change commit latency. Observed:
+
+| load | slow follower delay | outcome |
+|---|---|---|
+| 200/s | 25, 75, 120, 200, 400 ms | masked: commit p50 1.5 ms (baseline 1.4), no elections, all 50 runs complete. But peak heap is 331 to 354 MB against 3 MB for the baseline, for every delay |
+| 500/s | 40 ms | commit p50 1.6 ms, p99 64 ms (baseline 15), heap 1,910 MB, 10/10 complete |
+| 2,000/s | 25, 75, 120, 200, 400 ms (and 120, 400 ms with deadlines not enforced) | **every one of the 70 runs failed to complete**: it hit the 3000 MB guard or was OOM-killed. Achieved 364 to 901 writes/s of 2,000 offered, commit p50 295 to 850 ms, 10,000 to 32,000 writes unfinished per cell. Baseline at 2,000/s: 10/10 complete, p50 1.1 ms, heap 22 MB |
+| 3,000/s | 40 ms | 8 of 10 OOM-killed, 2 aborted |
+
+So on this implementation the quorum model is correct at low load and fails at moderate load: at 2,000 writes/s a follower that is merely 25 ms slow (a quarter of the RPC timeout, a tenth of the minimum election timeout) takes the whole cluster down, while the healthy follower and the leader are perfectly fast. No elections occurred in any follower-delay cell, so this is not an election effect; and it is the same with deadlines not enforced, so it is not an RPC-timeout effect.
+
+Mechanism and test. `replicateToAllPeers` starts one goroutine per peer per proposal with no in-flight limit, and each sends every entry the peer has not acknowledged. A slow follower acknowledges slowly, so the unacknowledged suffix grows and each new proposal resends it, which makes memory and CPU work grow with the square of the backlog. Stage 6 (prediction written beforehand) measured peak heap against offered rate with one follower at 40 ms:
+
+| offered /s | mean peak heap (MB), n=10 | max (MB) |
+|---|---|---|
+| 100 | 70 | 96 |
+| 200 | 267 | 349 |
+| 300 | 511 | 756 |
+| 400 | 896 | 1,288 |
+| 500 | 1,396 | 1,908 |
+| 700 | 1,894 (3 runs hit the guard) | 3,141 |
+
+The log-log slope of mean heap against rate over 100 to 500/s is 1.84. Scored against the prediction as written: the shape (about quadratic) holds, and neither "linear" failure clause fired (100/s is not above 175 MB; 400/s is not below 700 MB). The absolute numbers are 25 to 40% below the prediction from 300/s up, because I anchored on a maximum rather than a mean. And one failure clause **did** fire: "700/s stays under the guard in most runs" is true (7 of 10 runs stayed under 3000 MB). So the prediction partly failed as written, in the direction of less memory than predicted. Peak heap also depends on run length (20 s), which I did not vary.
+
+The causal test is stage 2a, an intervention rather than a correlation: `raft.Config.SingleFlightReplication` allows one outstanding AppendEntries per peer. With it, one follower at 40 ms: at 500/s heap 4 MB (1,902 MB off), p99 21.7 ms (70.3 off); at 2,000/s 10 of 10 runs complete, heap 18 MB, commit p50 1.7 ms, 0 writes unfinished, against 4 crashed and 6 guard-aborted runs with 15,830 writes unfinished with it off. Stage 2b, the same-file control I owed from 2a (40 runs): with no fault, the option off and on are indistinguishable at 500 and 2,000/s (p50 1.1 to 1.3 ms, 0 elections in all 40 runs, heap equal). In stage 2a the `on_none_2000` control had shown 6 elections and 1,390 lost writes in 3 of 10 runs; that did not reproduce in 20 runs here and I could not explain it, so I treat it as a transient and not as a cost of the option.
+
+Reading: the departure from the quorum model is real and large, its cause is the missing replication flow control (fixed by one in-flight RPC per peer), and it is an implementation property, not a property of Raft. Flow control on replication is standard in production Raft implementations, so this is a finding about this code, and a demonstration of how a "tolerates a slow follower" property can silently depend on it. It does not by itself make a research contribution.
+
+### H-B: can slow storage destabilize leadership? (stages 3, 4, 4c, 5)
+
+*Slow follower:* no. 0 elections in all follower-delay cells (delays up to 400 ms, 200 and 2,000 writes/s) and in the intermittent-stall cells with one stalled follower. Pre-vote and the handler structure absorb it. (The memory failure above is a different channel.)
+
+*Slow leader, constant delay, very low load (1 to 2 writes/s so nothing queues; stage 3):*
+
+| leader fsync delay | commit p50 (ms) | elections in 10 runs |
+|---|---|---|
+| 0 | 1.9 | 0 |
+| 50 ms | 52.5 | 0 |
+| 100 ms | 102.5 | 2 (baseline-level) |
+| 150 ms | 17.0 ±34 | 16 |
+| 200 ms | 2.2 | 14 |
+| 300 ms | 2.2 | 14 |
+| 500 ms | 2.0 | 10 |
+
+Up to 100 ms the leader keeps leadership and commit latency is the delay. From 150 ms (the lower end of the 150 to 300 ms election timeout) followers depose it, an election happens in nearly every run, and commit latency returns to normal because the new leader's disk has no injected delay. That is the intended design of leader election working, at roughly the point the code predicts. This is expected, not a departure.
+
+*Slow leader, constant delay far below the timeout, swept across utilisation (stage 5; rho = rate x (delay + 0.3 ms), 10 runs per cell):*
+
+| delay | rho 0.5 | 0.7 | 0.9 | 1.0 |
+|---|---|---|---|---|
+| 10 ms | 0 elections, p99 14.5 ms | 0, 26 ms | 0, 90 ms | **11 elections in 10 runs**, p50 731 ms, p99 2,651 ms, 108 failed proposals per run, 137 lost writes |
+| 25 ms | 0, 30 ms | 0, 46 ms | 0, 185 ms | **11 in 10 runs**, p99 609 ms, 12 failed per run, 101 lost |
+
+This is a departure from "delay well under the election timeout cannot cause an election". A leader whose fsync takes 10 to 25 ms, 6 to 30 times below the election timeout, loses leadership when its offered load reaches the capacity the fsync allows, 1/(d + 0.3 ms). Below that load (rho 0.9 and under) it does not. Stage 1 had 3 of 10 runs with an election at d=10 ms and 87/s (rho about 0.9), which stage 5 did not reproduce at the same load (0 of 10), so the boundary is somewhere between 0.9 and 1.0 and noisy.
+
+Mechanism evidence (correlational, from the instrumentation columns): in the 19 stage 5 runs with an election, the leader's replication call waited a median 1,007 ms for `r.mu` (44 ms in the 61 runs without) and the longest gap between AppendEntries arrivals at a follower was at least 184 ms in all 19 (median 260 ms), above the shortest election timeout. In the runs without an election the same gap was 150 ms or more in 7 of 61, which is expected because the election timeout is randomized from 150 to 300 ms and pre-vote needs the other follower to agree. This fits the audited structure (Round 8a): at rho around 1 the proposers queue on `r.mu`, each holding it across a fsync, the heartbeat goroutine queues behind them, and followers hear nothing. It is not proven. The test that would prove it is an intervention that moves fsync out of the lock, or heartbeats off it, and compares election counts at rho = 1.0; I have not done that.
+
+*Intermittent stalls at 200 writes/s (stages 4 and 4c, probability 0.002 per fsync, about 0.4 stalls per second at the leader):*
+
+| stalled node(s) | stall length | elections in 10 runs | failed proposals per run | commit p50 / p99 (ms) |
+|---|---|---|---|---|
+| none (control) | | 0 | 0 | 1.4 / 3 to 18 |
+| one follower | 300 ms | 0 | 0 | 1.4 / 4.2 |
+| one follower | 1000 ms | 0 | 0 | 1.5 / 20 |
+| leader | 300 ms | 16 | 52 | 1.5 / 4.0 |
+| leader | 1000 ms | 14 | 124 | 1.5 / 3.7 |
+| both followers, independent stalls (4c) | 300 ms | 0 | 0 | 1.4 / 74 ±46 (control 3.5) |
+| both followers, identical stall sequence (4b) | 300 ms | 0 | 0 | 1.4 / 132 ±72 (control 18 ±30) |
+
+Leader stalls are visible as elections, failed proposals and lost acknowledged writes, but not in commit p50 (and not in p99 either, because the elections move the leader and most arrivals are fast). Follower stalls do nothing to the leader. Two followers both stalling raises p99 only (74 ms with independent stalls, 132 ms when the stalls coincide) and still causes no election.
+
+A harness bug found while analyzing 4b: the stall seed was derived from `len(role)`, so F1 and F2 got identical stall sequences and 4b measured coincident stalls. Fixed (`roleSeed`, FNV-1a of the role name) and rerun as 4c. Single-role cells in stage 4 are unaffected. The 6-run 4b file is kept; its control showed elections in 2 of 3 runs, which did not reproduce in 10 runs in 4b-v2 (`raftload_stage4b_v2.csv`, 0 elections) or in 4c (0), so I treat it as a transient and 4b-v2/4c as authoritative.
+
+### Acknowledged writes lost to leadership change
+
+`lost` was nonzero only in runs that had elections: stage 5 (rho 1.0: 137 and 101 lost writes over 10 runs, in 9 and 8 runs), stage 4 leader stalls (60 and 117), and 1,390 in the unreproduced `on_none_2000` transient. Total over all 624 ok runs: 1,820, of which 1,390 are that transient. This is the acknowledge-after-local-append semantics (Round 8a) showing up under load: whenever storage-induced leader changes happen, some acknowledged writes disappear. No run showed a committed entry changing, which would be a Raft safety violation; none was expected.
+
+### Limits that apply to everything in this round
+
+One 2-vCPU container; in-process transport; three Raft nodes plus the load generator share the CPUs, so some saturation behaviour is CPU contention and not storage (stage 0 showed throughput falling past saturation for reasons I did not isolate); a 3000 MB heap guard and an OOM killer, not a production memory limit, define "failure" in the memory cells; 20 s runs; the injection delays `Append` fsyncs only, not the vote and term persistence paths (Round 8a); uniform and Bernoulli stalls only, not real device behaviour; leader and follower delays are applied to the initial leader's role, so after a leader change the new leader is fast. None of this has been run on separate machines or a real network.
+
+### Go / no-go for the next research hypothesis
+
+**Go**, narrowly, on one hypothesis: *in a Raft implementation that performs durable writes while holding the state lock, a leader's storage latency far below the election timeout can still cost it leadership once its offered load reaches its fsync-limited capacity, because heartbeats queue behind proposals on the lock.* Reasons: the effect is large and clean (about 1 election per run and about 100 acknowledged writes lost per 10 runs at rho 1.0 against 0 at rho 0.9 and below, in both delay settings), it departs from the delay-versus-timeout rule of thumb, and it has a concrete, cheap, decisive test. The test is a single intervention, fsync outside `r.mu` or heartbeats off it, compared against the current code at rho 0.5, 0.9, 1.0 and 1.2 with 10 repetitions per cell, plus the existing healthy-leader control.
+
+**No-go** on each of these for now:
+* Calling it novel. The shape (disk latency starves heartbeats; production systems document slow-disk-triggered elections and keep heartbeats off the disk path) is likely well known, and I have not done the literature and issue-tracker search for it (etcd, TiKV, CockroachDB, Raft dissertation guidance on persistence and heartbeats). The first step of "go" is that search; a result that is only "this implementation lacks what mature ones have" is an engineering finding, not a paper.
+* The replication flow-control result as a contribution. It is real and causally tested, and it is standard engineering.
+* Any statement that compaction causes election instability. No compaction runs were part of these experiments, the Round 6 compaction runs showed no effect on commit latency, and nothing here isolates compaction.
+* More benchmark expansion on this harness. The remaining open questions need either the intervention above or a real network and separate disks, not more cells.
+
+Things i would flag as unfinished: the unexplained baseline elections (3.9% of no-fault runs) and the unreproduced stage 2a transient mean the harness has a noise source i have not identified; and the stage 1 and stage 5 disagreement at rho of about 0.9.
