@@ -124,3 +124,37 @@ What it shows: all eight cells compact repeatedly, and write amplification comes
 What it does not show: any effect on replication. This is engine-only. The compaction duty cycle is small, so a compaction effect on commit latency may be small too. The quorum-masking experiment should not depend on compaction to create slowness; it injects fsync delay directly.
 
 The raw run with 4 concurrent writers (`results/calibration_v1.csv`) is kept for the F17 evidence; its numbers include failed puts and should not be used for anything else (its `busy_ms` also excluded merge time, since fixed).
+
+## Round 6: replicated runs through Raft on a workload that compacts
+
+Harness changes (commit `148f362`): `bench.Keys` and `bench.ValueBytes` set the workload; after proposals return, the run waits for every node to apply the leader's final commit index before reading engine counters (F5); counters come from `/stats` without forcing a flush; p95 commit latency, drain time, applied fraction and bridge apply errors are reported; JVM stdout goes to stderr so CSVs are clean. Driver: `research/cmd/calibrun`, which runs each config once per randomized block (seeded order).
+
+Workload (chosen from the Round 5 calibration criteria before this run, not tuned afterwards): 100,000 keys, 1,000-byte random values, 90% writes, 20,000 ops per run, 32 closed-loop clients, 64 KiB memtable, three JVMs and three in-process Raft nodes on the 2-vCPU host. Five configs, five blocks, 25 runs. Raw data: `results/replicated_calibrated_v1.csv`. An earlier start of this run was killed after about a minute because I ran `go test -race` on the same 2 vCPUs; the CSV here is the clean rerun, and nothing else ran on the host during it.
+
+Health: 0 failed proposals, 0 commit timeouts, 0 bridge apply errors, applied fraction 1.0 in all 25 runs.
+
+Means over 5 runs per config, with 95% t-intervals (n=5, so these are rough):
+
+| config | ops/s | commit p50 ms | commit p95 ms | commit p99 ms | compactions (3 nodes) | engine busy ms | peak sstables | engine write amp |
+|---|---|---|---|---|---|---|---|---|
+| static_leveled | 1345 ±33 | 13.2 ±1.2 | 29.3 ±0.6 | 38.8 ±1.6 | 43.8 | 3391 | 24 | 6.62 |
+| static_tiered | 1324 ±72 | 12.6 ±1.8 | 29.4 ±1.5 | 38.0 ±2.9 | 42.4 | 3575 | 32 | 6.61 |
+| adaptive_both | 1391 ±55 | 11.5 ±0.5 | 27.7 ±1.1 | 35.4 ±1.4 | 42.6 | 3641 | 29 | 6.68 |
+| node0 leveled, others tiered | 1327 ±66 | 12.6 ±2.2 | 28.9 ±1.3 | 36.9 ±2.0 | 43.4 | 3482 | 20 | 6.64 |
+| no_compaction | 1390 ±63 | 11.8 ±1.2 | 29.4 ±1.3 | 38.3 ±2.1 | 0 | 0 | 272 | 1.01 |
+
+Position in the run order (1 to 5) and block number showed no trend (ops/s by position 1339, 1335, 1349, 1368, 1385; by block 1320, 1351, 1404, 1344, 1358).
+
+What this establishes, for this host and this harness only:
+
+* Compaction really ran: about 43 compactions and about 3.4 s of engine busy time summed over the three nodes in every compacting config, engine write amplification about 6.6 against 1.01 without compaction. The Round 1 to 4 problem (nothing compacted) is fixed.
+* With that compaction running, throughput and commit latency are not distinguishable from running no compaction at all, at this sample size. The `no_compaction` row is the control and sits inside the same intervals as the other four.
+* The nominal "mismatched" and "adaptive" configs are not distinguishable from static ones either. That is expected given F16 (leveled and tiered are the same algorithm with different triggers) and the identical compaction counts above.
+
+What it does not establish:
+
+* It does not show that compaction cannot affect replication. Three things limit the test. (1) Commit does not depend on apply (see `ARCHITECTURE_AND_DATA_FLOW.md`), so commit latency is structurally insulated from engine work unless they share a resource. Here they share CPU only. (2) Apply is the bottleneck in every config: proposals finish in about 15 s and the nodes need about 17 to 19 s more to drain, with no compaction effect on that drain time either (17.2 s with no compaction, 18.0 to 19.0 s with). Each apply is two HTTP round trips to the local JVM (a PUT and a `/stats` GET), which may dwarf a compaction effect of a few percent duty cycle. (3) Every number comes from one 2-vCPU container with an in-process transport and one shared disk.
+* The adaptive config shows lower p99 commit latency (35.4 ms) than static leveled (38.8 ms) with non-overlapping 95% intervals. With five configs, four latency metrics and n=5, a gap like this is expected to appear by chance somewhere, and nothing in the mechanism predicts it. I do not treat it as a finding. It would need a pre-registered repeat.
+* Commit latency here is closed loop with 32 clients; its ~12 ms median is mostly queueing on the leader's serialized fsync (finding F13, untested). That is why the quorum-masking experiment is open loop.
+
+Write amplification, resolved enough to use: engine write amplification as defined in Round 5 (flush bytes plus compaction output bytes over logical bytes, counters read after the drain) is stable at 6.3 to 7.0 across compacting runs and 1.01 without compaction. The bench's own `WriteAmplification` field (follower 1, forced flush) should still not be used.
