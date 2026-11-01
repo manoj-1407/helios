@@ -24,6 +24,9 @@ type StatsSnapshot struct {
 	Compactions        int64   `json:"compactions"`
 	TablesCompacted    int64   `json:"tables_compacted"`
 	CompactionBusyMs   int64   `json:"compaction_busy_ms"`
+	LogicalBytes       int64   `json:"logical_bytes"`
+	FlushBytes         int64   `json:"flush_bytes"`
+	CompactionBytes    int64   `json:"compaction_bytes"`
 }
 
 type DataPoint struct {
@@ -248,6 +251,10 @@ func (b *HeliosKVBridge) Health(ctx context.Context) error {
 	}
 	return nil
 }
+
+// StatsNoFlush reads /stats without forcing a memtable flush, so counters are
+// not perturbed by the read itself.
+func (b *HeliosKVBridge) StatsNoFlush() (*StatsSnapshot, error) { return b.fetchStats() }
 
 func (b *HeliosKVBridge) fetchStats() (*StatsSnapshot, error) {
 	req, _ := http.NewRequest(http.MethodGet, b.baseURL+"/stats", nil)

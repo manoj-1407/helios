@@ -21,10 +21,17 @@ type CompactionConfig struct {
 }
 
 var ThesisConfigs = []CompactionConfig{
-	{"adaptive_both",  "ADAPTIVE",      "ADAPTIVE"},
-	{"mismatched",     "FORCE_LEVELED", "FORCE_TIERED"},
+	{"adaptive_both", "ADAPTIVE", "ADAPTIVE"},
+	{"mismatched", "FORCE_LEVELED", "FORCE_TIERED"},
 	{"static_leveled", "FORCE_LEVELED", "FORCE_LEVELED"},
 }
+
+// Workload shape. The defaults are the original thesis workload (200 keys, short
+// values), which never flushes or compacts (audit F4). Set before calling Run.
+var (
+	Keys       = 200
+	ValueBytes = 0 // 0 = legacy short value; >0 = random lowercase string of this length
+)
 
 type BenchResult struct {
 	Config             CompactionConfig
@@ -47,6 +54,20 @@ type BenchResult struct {
 	CommitP50Ns    int64
 	CommitP99Ns    int64
 	CommitTimeouts int64
+	CommitP95Ns    int64
+
+	// after all proposals returned, wait for every node to apply the leader's
+	// final commit index; DrainSeconds is that wait, AppliedFraction is the
+	// minimum over nodes of LastApplied / final commit index when it ended.
+	DrainSeconds    float64
+	AppliedFraction float64
+	BridgeApplyErrs int64
+
+	// engine counters summed over the 3 JVMs, read without forcing a flush
+	Flushes, Compactions, TablesCompacted     int64
+	CompactionBusyMs                          int64
+	LogicalBytes, FlushBytes, CompactionBytes int64
+	MaxSSTables                               int
 }
 
 func (r BenchResult) Print() {
@@ -160,12 +181,12 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 			// rand.Rand is not goroutine-safe: derive a per-op generator from the
 			// run seed so the workload is reproducible (F15)
 			lr := rand.New(rand.NewSource(42 + int64(n)))
-			key := fmt.Sprintf("key%d", lr.Intn(200))
+			key := fmt.Sprintf("key%d", lr.Intn(Keys))
 			if lr.Float64() < writeRatio {
 				cmd := store.EncodeCommand(store.Command{
 					Type:  store.CmdPut,
 					Key:   key,
-					Value: fmt.Sprintf("v-%d-%d", n, time.Now().UnixNano()),
+					Value: makeValue(lr, n),
 				})
 				leader := cluster.Leader()
 				if leader == nil {
@@ -210,6 +231,48 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 	wg.Wait()
 	duration := time.Since(start)
 
+	// drain: do not read counters or kill JVMs while applies are still queued (F5)
+	drainStart := time.Now()
+	var finalCommit uint64
+	for _, nd := range cluster.AllNodes() {
+		if c := nd.CommitIndex(); c > finalCommit {
+			finalCommit = c
+		}
+	}
+	appliedFraction := 1.0
+	for {
+		minApplied := finalCommit
+		for _, nd := range cluster.AllNodes() {
+			if a := nd.LastApplied(); a < minApplied {
+				minApplied = a
+			}
+		}
+		if finalCommit > 0 {
+			appliedFraction = float64(minApplied) / float64(finalCommit)
+		}
+		if minApplied >= finalCommit || time.Since(drainStart) > 180*time.Second {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	drainSeconds := time.Since(drainStart).Seconds()
+	var agg BenchResult
+	for _, b := range bridges {
+		agg.BridgeApplyErrs += b.Metrics.ApplyErrCount.Load()
+		if st, serr := b.StatsNoFlush(); serr == nil {
+			agg.Flushes += st.Flushes
+			agg.Compactions += st.Compactions
+			agg.TablesCompacted += st.TablesCompacted
+			agg.CompactionBusyMs += st.CompactionBusyMs
+			agg.LogicalBytes += st.LogicalBytes
+			agg.FlushBytes += st.FlushBytes
+			agg.CompactionBytes += st.CompactionBytes
+			if st.SstableCount > agg.MaxSSTables {
+				agg.MaxSSTables = st.SstableCount
+			}
+		}
+	}
+
 	var allLags []int64
 	var lagAfterCompaction []int64
 	var totalCompactionSwitches int64
@@ -250,9 +313,15 @@ func Run(cfg CompactionConfig, ops int, writeRatio float64) (BenchResult, error)
 	sort.Slice(ackLat, func(i, j int) bool { return ackLat[i] < ackLat[j] })
 	sort.Slice(commitLat, func(i, j int) bool { return commitLat[i] < commitLat[j] })
 	result.CommitTimeouts = commitTimeouts
+	result.DrainSeconds, result.AppliedFraction = drainSeconds, appliedFraction
+	result.BridgeApplyErrs = agg.BridgeApplyErrs
+	result.Flushes, result.Compactions, result.TablesCompacted = agg.Flushes, agg.Compactions, agg.TablesCompacted
+	result.CompactionBusyMs, result.MaxSSTables = agg.CompactionBusyMs, agg.MaxSSTables
+	result.LogicalBytes, result.FlushBytes, result.CompactionBytes = agg.LogicalBytes, agg.FlushBytes, agg.CompactionBytes
 	if len(commitLat) > 0 {
 		result.AckP99Ns = percentile(ackLat, 99)
 		result.CommitP50Ns = percentile(commitLat, 50)
+		result.CommitP95Ns = percentile(commitLat, 95)
 		result.CommitP99Ns = percentile(commitLat, 99)
 	}
 	if len(allLags) > 0 {
@@ -289,11 +358,11 @@ func RunAll(ops int) ([]BenchResult, error) {
 // compared across runs. The Grafana dashboard can consume it via the
 // SimpleJSON data source plugin if needed.
 type ThesisReport struct {
-	RunAt     string       `json:"run_at"`    // RFC3339
-	GitCommit string       `json:"git_commit"` // HEAD at time of run, empty if unknown
-	Ops       int          `json:"ops_per_config"`
-	WriteRatio float64     `json:"write_ratio"`
-	Results   []BenchResult `json:"results"`
+	RunAt      string        `json:"run_at"`     // RFC3339
+	GitCommit  string        `json:"git_commit"` // HEAD at time of run, empty if unknown
+	Ops        int           `json:"ops_per_config"`
+	WriteRatio float64       `json:"write_ratio"`
+	Results    []BenchResult `json:"results"`
 }
 
 // WriteJSON serialises results to a JSON file at the given path, creating
@@ -380,12 +449,25 @@ func startHeliosKV(dataDir string, port int, mode string) *exec.Cmd {
 	jar := "helios-kv/helios-kv.jar"
 	cmd := exec.Command("java", "-jar", jar,
 		"server", dataDir, fmt.Sprintf("%d", port), mode, "65536")
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // keep stdout clean for csv drivers
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		panic(fmt.Sprintf("start helios-kv port=%d: %v", port, err))
 	}
 	return cmd
+}
+
+const valueAlphabet = "abcdefghijklmnopqrstuvwxyz"
+
+func makeValue(lr *rand.Rand, n int) string {
+	if ValueBytes <= 0 {
+		return fmt.Sprintf("v-%d-%d", n, time.Now().UnixNano())
+	}
+	b := make([]byte, ValueBytes)
+	for i := range b {
+		b[i] = valueAlphabet[lr.Intn(len(valueAlphabet))]
+	}
+	return string(b)
 }
 
 func percentile(sorted []int64, p int) int64 {

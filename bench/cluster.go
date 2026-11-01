@@ -77,6 +77,14 @@ func (bc *BenchCluster) Leader() *raft.RaftNode {
 	return nil
 }
 
+func (bc *BenchCluster) AllNodes() []*raft.RaftNode {
+	out := make([]*raft.RaftNode, 0, len(bc.nodes))
+	for _, n := range bc.nodes {
+		out = append(out, n)
+	}
+	return out
+}
+
 func (bc *BenchCluster) AllBridges() []*store.HeliosKVBridge {
 	out := make([]*store.HeliosKVBridge, 0, len(bc.bridges))
 	for _, b := range bc.bridges {

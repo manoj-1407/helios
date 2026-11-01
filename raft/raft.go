@@ -145,6 +145,13 @@ func (r *RaftNode) State() NodeState {
 	return r.state
 }
 
+// LastApplied is the highest index handed to the state machine successfully.
+func (r *RaftNode) LastApplied() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.volatile.LastApplied
+}
+
 func (r *RaftNode) Term() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
