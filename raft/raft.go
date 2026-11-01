@@ -145,6 +145,13 @@ func (r *RaftNode) State() NodeState {
 	return r.state
 }
 
+// SetFsyncDelay injects a delay before every Raft-log fsync on this node.
+func (r *RaftNode) SetFsyncDelay(d time.Duration) { r.log.SetFsyncDelay(d) }
+
+// FsyncStats reports this node's Raft-log fsync count, total fsync wall time and
+// total injected delay.
+func (r *RaftNode) FsyncStats() (count, totalNs, injectedNs int64) { return r.log.FsyncStats() }
+
 // LastApplied is the highest index handed to the state machine successfully.
 func (r *RaftNode) LastApplied() uint64 {
 	r.mu.Lock()

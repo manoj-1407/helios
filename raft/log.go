@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type LogEntry struct {
@@ -43,6 +45,36 @@ type RaftLog struct {
 	offsets []int64 // offsets[i] is the byte offset in file where entries[i] starts
 	path    string
 	file    *os.File
+
+	// fault injection for experiments (research/EXPERIMENT_DESIGN.md M11).
+	// the delay is slept before the real fsync inside Append, so it is paid
+	// under the same locks a slow device would be, and every sync is counted so
+	// a run can prove the delay was actually reached.
+	fsyncDelayNs atomic.Int64
+	syncCount    atomic.Int64
+	syncTotalNs  atomic.Int64 // wall time of all Append syncs including injected delay
+	injectedNs   atomic.Int64
+}
+
+// SetFsyncDelay makes every subsequent Append sleep d before its fsync.
+func (l *RaftLog) SetFsyncDelay(d time.Duration) { l.fsyncDelayNs.Store(int64(d)) }
+
+// FsyncStats returns the number of Append fsyncs, their total wall time, and
+// the total delay injected into them.
+func (l *RaftLog) FsyncStats() (count int64, totalNs int64, injectedNs int64) {
+	return l.syncCount.Load(), l.syncTotalNs.Load(), l.injectedNs.Load()
+}
+
+func (l *RaftLog) syncForAppend() error {
+	start := time.Now()
+	if d := l.fsyncDelayNs.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+		l.injectedNs.Add(d)
+	}
+	err := l.file.Sync()
+	l.syncCount.Add(1)
+	l.syncTotalNs.Add(time.Since(start).Nanoseconds())
+	return err
 }
 
 const logRecordHeaderSize = 8 + 8 + 4 + 4 // term + index + cmdLen + checksum
@@ -167,7 +199,7 @@ func (l *RaftLog) Append(entries ...LogEntry) error {
 		offset += int64(logRecordHeaderSize) + int64(len(e.Command))
 	}
 
-	if err := l.file.Sync(); err != nil {
+	if err := l.syncForAppend(); err != nil {
 		return fmt.Errorf("fsyncing log file: %w", err)
 	}
 	return nil
