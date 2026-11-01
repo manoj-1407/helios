@@ -97,6 +97,10 @@ func main() {
 	dur := flag.Duration("dur", 20*time.Second, "arrival window per run")
 	warm := flag.Duration("warmup", 4*time.Second, "arrivals in this window are not measured")
 	seed := flag.Int64("seed", 1, "seed for block order and workload")
+	single := flag.Int("single", -1, "run only cell number N (0-based) once and print one csv row; used by research/run_plan.py so each run has its own process")
+	repN := flag.Int("rep", 1, "rep number to record in single mode")
+	posN := flag.Int("pos", 1, "position to record in single mode")
+	hdrOnly := flag.Bool("header", false, "print the csv header and exit")
 	flag.Parse()
 	cells, err := parseCells(*cellsPath)
 	if err != nil || len(cells) == 0 {
@@ -105,14 +109,27 @@ func main() {
 	}
 	rng := rand.New(rand.NewSource(*seed))
 	hdr := "rep,pos,label,rate,enforce,delays,stalls,dur_s,leader_start,leader_end,offered,issued,dropped,gen_slip_max_ms,measured,failed,lost,unfinished,achieved_per_s," +
-		"ack_p50_ms,ack_p99_ms,commit_p50_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,max_inflight,no_leader_frac,term_start,term_end,leader_changes,elections,prevotes"
+		"ack_p50_ms,ack_p99_ms,commit_p50_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,max_inflight,no_leader_frac,term_start,term_end,leader_changes,elections,prevotes,peak_heap_mb,peak_goroutines,mem_abort"
 	for _, r := range []string{"L", "F1", "F2"} {
 		hdr += fmt.Sprintf(",%[1]s_syncs,%[1]s_injected_ms,%[1]s_stalls,%[1]s_sync_max_ms,%[1]s_propose_wait_max_ms,%[1]s_repl_wait_max_ms,%[1]s_handleae_wait_max_ms,%[1]s_handleae_wait_ge100,%[1]s_aegap_max_ms,%[1]s_aegap_ge100", r)
 	}
-	fmt.Println(hdr)
+	if *hdrOnly {
+		fmt.Println(hdr)
+		return
+	}
+	if *single < 0 {
+		fmt.Println(hdr)
+	}
 	ms := func(ns int64) float64 { return float64(ns) / 1e6 }
 	for rep := 1; rep <= *reps; rep++ {
-		for pos, idx := range rng.Perm(len(cells)) {
+		order := rng.Perm(len(cells))
+		if *single >= 0 {
+			order, rep = []int{*single}, *repN
+		}
+		for pos, idx := range order {
+			if *single >= 0 {
+				pos = *posN - 1
+			}
 			c := cells[idx]
 			r, err := bench.RunRaftLoad(bench.LoadSpec{Label: c.label, Rate: c.rate, Duration: *dur, Warmup: *warm,
 				Delay: c.delays, Stall: c.stalls, EnforceDeadlines: c.enforce, Seed: *seed*1000 + int64(rep)})
@@ -129,6 +146,11 @@ func main() {
 				r.Offered, r.Issued, r.Dropped, ms(r.GenSlipMaxNs), r.Measured, r.Failed, r.Lost, r.Unfinished, r.AchievedPerSec,
 				ms(r.AckP50Ns), ms(r.AckP99Ns), ms(r.CommitP50Ns), ms(r.CommitP95Ns), ms(r.CommitP99Ns), ms(r.CommitMaxNs),
 				r.MaxInFlight, r.NoLeaderFrac, r.TermStart, r.TermEnd, r.LeaderChanges, r.Elections, r.PreVotes)
+			ab := 0
+			if r.MemAbort {
+				ab = 1
+			}
+			fmt.Printf(",%d,%d,%d", r.PeakHeapMB, r.PeakGoroutines, ab)
 			for _, role := range []string{"L", "F1", "F2"} {
 				s := r.Role[role]
 				fmt.Printf(",%d,%.0f,%d,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%d", s.Syncs, ms(s.InjectedNs), s.Stalls, ms(s.SyncMaxNs),
@@ -139,6 +161,9 @@ func main() {
 			fmt.Println()
 			fmt.Fprintf(os.Stderr, "[raftload] rep %d pos %d %s done\n", rep, pos+1, c.label)
 			time.Sleep(500 * time.Millisecond)
+		}
+		if *single >= 0 {
+			return
 		}
 	}
 }

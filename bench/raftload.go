@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,7 @@ type LoadSpec struct {
 	Stall            map[string]StallSpec
 	EnforceDeadlines bool // network-like RPC deadlines in the in-process transport
 	MaxInFlight      int  // arrivals beyond this many unfinished writes are dropped (default 20000)
+	MemLimitMB       int  // abort the run if the Go heap exceeds this (default 3000); the result is flagged MemAbort
 	Seed             int64
 }
 
@@ -65,6 +67,9 @@ type LoadResult struct {
 	TermStart, TermEnd                    uint64
 	LeaderChanges, Elections, PreVotes    int64 // summed over nodes, excluding the initial election
 	Role                                  map[string]RoleStats
+
+	PeakHeapMB, PeakGoroutines int
+	MemAbort                   bool // heap limit hit; the run was cut short and its latencies are not comparable
 }
 
 type loadOp struct {
@@ -77,6 +82,9 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 	res := LoadResult{Spec: spec, Role: map[string]RoleStats{}}
 	if spec.MaxInFlight == 0 {
 		spec.MaxInFlight = 20000
+	}
+	if spec.MemLimitMB == 0 {
+		spec.MemLimitMB = 3000
 	}
 	transport := raft.NewChannelTransport()
 	transport.SetEnforceDeadlines(spec.EnforceDeadlines)
@@ -180,6 +188,35 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		}
 	}()
 
+	// resource guard: sample heap and goroutines; past the limit, stop generating.
+	var memAbort atomic.Bool
+	var peakHeap, peakG atomic.Int64
+	stopMem := make(chan struct{})
+	memDone := make(chan struct{})
+	go func() {
+		defer close(memDone)
+		t := time.NewTicker(100 * time.Millisecond)
+		defer t.Stop()
+		var ms runtime.MemStats
+		for {
+			select {
+			case <-stopMem:
+				return
+			case <-t.C:
+				runtime.ReadMemStats(&ms)
+				if h := int64(ms.HeapAlloc >> 20); h > peakHeap.Load() {
+					peakHeap.Store(h)
+				}
+				if g := int64(runtime.NumGoroutine()); g > peakG.Load() {
+					peakG.Store(g)
+				}
+				if int(ms.HeapAlloc>>20) > spec.MemLimitMB {
+					memAbort.Store(true)
+				}
+			}
+		}
+	}()
+
 	var mu sync.Mutex
 	var ops, pending []*loadOp
 	maxInFlight := 0
@@ -231,6 +268,9 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		if intended.Sub(start) >= spec.Duration {
 			break
 		}
+		if memAbort.Load() {
+			break
+		}
 		if d := time.Until(intended); d > 0 {
 			time.Sleep(d)
 		}
@@ -267,7 +307,9 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 			mu.Unlock()
 		}(p, cmd)
 	}
-	wg.Wait()
+	if !memAbort.Load() {
+		wg.Wait()
+	}
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
 		mu.Lock()
 		n := len(pending)
@@ -280,6 +322,9 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 	<-watchDone
 	close(stopSample)
 	<-sampleDone
+	close(stopMem)
+	<-memDone
+	res.PeakHeapMB, res.PeakGoroutines, res.MemAbort = int(peakHeap.Load()), int(peakG.Load()), memAbort.Load()
 
 	if l := findLeader(); l != nil {
 		res.LeaderEnd = l.ID()

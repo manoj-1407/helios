@@ -1,0 +1,9 @@
+# stage 3 (H-B, leader side): slow leader, fast followers, delay around the 150-300 ms election timeout.
+# rate kept below the leader's capacity 1/(d+0.3ms) so the queue does not grow. enforce=1.
+base_2        2     1 -          -
+Ld50_2        2     1 L=50ms     -
+Ld100_2       2     1 L=100ms    -
+Ld150_2       2     1 L=150ms    -
+Ld200_2       2     1 L=200ms    -
+Ld300_1       1     1 L=300ms    -
+Ld500_1       1     1 L=500ms    -

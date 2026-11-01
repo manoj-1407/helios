@@ -1,0 +1,17 @@
+# stage 2 (H-B, follower side): one slow follower, fast quorum available, delay below / near / above the 100 ms
+# rpc timeout and the 150-300 ms election timeout. low (200/s) and near-knee (2000/s) load. enforce=1 except where marked.
+base_200      200   1 -          -
+base_2000     2000  1 -          -
+F1d25_200     200   1 F1=25ms    -
+F1d75_200     200   1 F1=75ms    -
+F1d120_200    200   1 F1=120ms   -
+F1d200_200    200   1 F1=200ms   -
+F1d400_200    200   1 F1=400ms   -
+F1d25_2000    2000  1 F1=25ms    -
+F1d75_2000    2000  1 F1=75ms    -
+F1d120_2000   2000  1 F1=120ms   -
+F1d200_2000   2000  1 F1=200ms   -
+F1d400_2000   2000  1 F1=400ms   -
+# contrast: deadlines not enforced (a slow handler can never time out)
+F1d120_2000_noenf  2000 0 F1=120ms -
+F1d400_2000_noenf  2000 0 F1=400ms -
