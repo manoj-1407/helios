@@ -145,6 +145,7 @@ func (r *RaftNode) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnap
 	r.volatile.LastApplied = req.LastIncludedIndex
 	if req.LastIncludedIndex > r.volatile.CommitIndex {
 		r.volatile.CommitIndex = req.LastIncludedIndex
+		r.obsCommit.Store(req.LastIncludedIndex)
 	}
 
 	term := r.persisted.CurrentTerm

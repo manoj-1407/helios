@@ -54,6 +54,38 @@ type RaftLog struct {
 	syncCount    atomic.Int64
 	syncTotalNs  atomic.Int64 // wall time of all Append syncs including injected delay
 	injectedNs   atomic.Int64
+
+	// intermittent stalls: each Append sync stalls for stallNs with probability
+	// stallPPM / 1e6, decided by a seeded splitmix64 stream.
+	stallPPM   atomic.Int64
+	stallNs    atomic.Int64
+	stallCount atomic.Int64
+	rngState   atomic.Uint64
+	syncMaxNs  atomic.Int64
+}
+
+// SetFsyncStall makes each Append sync stall for d with probability p (0..1),
+// on top of any constant delay. seed fixes the stall pattern.
+func (l *RaftLog) SetFsyncStall(p float64, d time.Duration, seed uint64) {
+	l.rngState.Store(seed)
+	l.stallNs.Store(int64(d))
+	l.stallPPM.Store(int64(p * 1e6))
+}
+
+// FsyncDetail extends FsyncStats with the number of injected stalls and the
+// longest single Append sync.
+func (l *RaftLog) FsyncDetail() (stalls, maxNs int64) { return l.stallCount.Load(), l.syncMaxNs.Load() }
+
+func (l *RaftLog) rollStall() bool {
+	ppm := l.stallPPM.Load()
+	if ppm <= 0 {
+		return false
+	}
+	z := l.rngState.Add(0x9E3779B97F4A7C15)
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	z ^= z >> 31
+	return int64(z%1_000_000) < ppm
 }
 
 // SetFsyncDelay makes every subsequent Append sleep d before its fsync.
@@ -71,9 +103,22 @@ func (l *RaftLog) syncForAppend() error {
 		time.Sleep(time.Duration(d))
 		l.injectedNs.Add(d)
 	}
+	if l.rollStall() {
+		d := l.stallNs.Load()
+		time.Sleep(time.Duration(d))
+		l.injectedNs.Add(d)
+		l.stallCount.Add(1)
+	}
 	err := l.file.Sync()
 	l.syncCount.Add(1)
-	l.syncTotalNs.Add(time.Since(start).Nanoseconds())
+	el := time.Since(start).Nanoseconds()
+	l.syncTotalNs.Add(el)
+	for {
+		m := l.syncMaxNs.Load()
+		if el <= m || l.syncMaxNs.CompareAndSwap(m, el) {
+			break
+		}
+	}
 	return err
 }
 

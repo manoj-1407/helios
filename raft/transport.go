@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,7 +45,17 @@ type ChannelTransport struct {
 	mu     sync.RWMutex
 	nodes  map[string]*RaftNode
 	faults NetworkFaultInjector
+
+	// enforce makes Send* honour the caller's context deadline while the remote
+	// handler is running, like a network RPC would: the caller gets ctx.Err() at
+	// the deadline and the handler keeps running on the remote node. by default
+	// (false) the handler runs synchronously and the deadline only bounds
+	// injected link delay, so a slow handler can never cause a timeout.
+	enforce atomic.Bool
 }
+
+// SetEnforceDeadlines switches network-like deadline behaviour on or off.
+func (t *ChannelTransport) SetEnforceDeadlines(on bool) { t.enforce.Store(on) }
 
 func NewChannelTransport() *ChannelTransport {
 	return &ChannelTransport{nodes: make(map[string]*RaftNode)}
@@ -111,6 +122,16 @@ func (t *ChannelTransport) SendRequestVote(ctx context.Context, peer string, req
 	if !ok {
 		return RequestVoteResponse{}, fmt.Errorf("transport: unknown peer %s", peer)
 	}
+	if t.enforce.Load() {
+		ch := make(chan RequestVoteResponse, 1)
+		go func() { ch <- node.HandleRequestVote(req) }()
+		select {
+		case r := <-ch:
+			return r, nil
+		case <-ctx.Done():
+			return RequestVoteResponse{}, ctx.Err()
+		}
+	}
 	return node.HandleRequestVote(req), nil
 }
 
@@ -122,6 +143,16 @@ func (t *ChannelTransport) SendPreVote(ctx context.Context, peer string, req Pre
 	if !ok {
 		return PreVoteResponse{}, fmt.Errorf("transport: unknown peer %s", peer)
 	}
+	if t.enforce.Load() {
+		ch := make(chan PreVoteResponse, 1)
+		go func() { ch <- node.HandlePreVote(req) }()
+		select {
+		case r := <-ch:
+			return r, nil
+		case <-ctx.Done():
+			return PreVoteResponse{}, ctx.Err()
+		}
+	}
 	return node.HandlePreVote(req), nil
 }
 
@@ -132,6 +163,16 @@ func (t *ChannelTransport) SendAppendEntries(ctx context.Context, peer string, r
 	node, ok := t.lookup(peer)
 	if !ok {
 		return AppendEntriesResponse{}, fmt.Errorf("transport: unknown peer %s", peer)
+	}
+	if t.enforce.Load() {
+		ch := make(chan AppendEntriesResponse, 1)
+		go func() { ch <- node.HandleAppendEntries(req) }()
+		select {
+		case r := <-ch:
+			return r, nil
+		case <-ctx.Done():
+			return AppendEntriesResponse{}, ctx.Err()
+		}
 	}
 	return node.HandleAppendEntries(req), nil
 }

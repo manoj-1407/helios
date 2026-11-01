@@ -99,6 +99,18 @@ type RaftNode struct {
 
 	metrics    *RaftMetrics
 	RepMetrics *ReplicationMetrics // exported so store/bridge can read pressure level
+
+	// instrumentation (instrument.go)
+	inProposeWait, inReplicateWait, inHandleAEWait, inAEGap waitStats
+	inLastAE                                                atomic.Int64
+	inPreVotes, inElections                                 atomic.Int64
+
+	// lock-free mirrors of state, term and commit index, written next to every
+	// mutation under r.mu. observers (load generators, samplers) read these so
+	// they never contend on r.mu, the lock under study.
+	obsState  atomic.Int32
+	obsTerm   atomic.Uint64
+	obsCommit atomic.Uint64
 }
 
 // NewRaftNode constructs a node and loads whatever persistent state and
@@ -120,7 +132,7 @@ func NewRaftNode(id string, peers []string, dataDir string, transport Transport,
 		return nil, fmt.Errorf("opening raft log for node %s: %w", id, err)
 	}
 
-	return &RaftNode{
+	n := &RaftNode{
 		id:        id,
 		peers:     peers,
 		cfg:       cfg.withDefaults(),
@@ -134,7 +146,9 @@ func NewRaftNode(id string, peers []string, dataDir string, transport Transport,
 		stopC:      make(chan struct{}),
 		metrics:    newRaftMetrics(),
 		RepMetrics: NewReplicationMetrics(),
-	}, nil
+	}
+	n.obsTerm.Store(persisted.CurrentTerm)
+	return n, nil
 }
 
 func (r *RaftNode) ID() string { return r.id }
@@ -145,8 +159,33 @@ func (r *RaftNode) State() NodeState {
 	return r.state
 }
 
+// CommitTermAt returns the term of the entry at index if that index is at or
+// below this node's commit index. It lets a load generator tell "my write
+// committed" from "another write committed at the same index after a leader
+// change".
+func (r *RaftNode) CommitTermAt(index uint64) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index > r.volatile.CommitIndex {
+		return 0, false
+	}
+	e, ok := r.log.Get(index)
+	if !ok {
+		return 0, false
+	}
+	return e.Term, true
+}
+
 // SetFsyncDelay injects a delay before every Raft-log fsync on this node.
 func (r *RaftNode) SetFsyncDelay(d time.Duration) { r.log.SetFsyncDelay(d) }
+
+// SetFsyncStall injects intermittent stalls into this node's Raft-log fsyncs.
+func (r *RaftNode) SetFsyncStall(p float64, d time.Duration, seed uint64) {
+	r.log.SetFsyncStall(p, d, seed)
+}
+
+// FsyncDetail reports the number of injected stalls and the longest Append sync.
+func (r *RaftNode) FsyncDetail() (stalls, maxNs int64) { return r.log.FsyncDetail() }
 
 // FsyncStats reports this node's Raft-log fsync count, total fsync wall time and
 // total injected delay.
@@ -277,6 +316,7 @@ func (r *RaftNode) runElection() {
 	r.mu.Lock()
 	baseTerm := r.persisted.CurrentTerm
 	r.mu.Unlock()
+	r.inPreVotes.Add(1)
 
 	if !r.runPreVote() {
 		r.resetElectionTimer() // no quorum interest yet -- back off and let the timer try again later
@@ -297,9 +337,12 @@ func (r *RaftNode) runElection() {
 		return
 	}
 	r.persisted.CurrentTerm++
+	r.obsTerm.Store(r.persisted.CurrentTerm)
+	r.inElections.Add(1)
 	r.persisted.VotedFor = r.id
 	term := r.persisted.CurrentTerm
 	r.state = Candidate
+	r.obsState.Store(int32(Candidate))
 	lastIndex, lastTerm := r.log.LastIndexAndTerm()
 	peers := append([]string(nil), r.peers...)
 	if err := SavePersistentState(r.dataDir, r.persisted); err != nil {
@@ -308,8 +351,10 @@ func (r *RaftNode) runElection() {
 		// proceed -- revert the in-memory bump and bail rather than run
 		// an election whose outcome we couldn't honor on a crash.
 		r.persisted.CurrentTerm--
+		r.obsTerm.Store(r.persisted.CurrentTerm)
 		r.persisted.VotedFor = ""
 		r.state = Follower
+		r.obsState.Store(int32(Follower))
 		r.mu.Unlock()
 		r.resetElectionTimer()
 		return
@@ -394,6 +439,7 @@ func (r *RaftNode) becomeLeader(term uint64) {
 		return // stale -- something changed while votes were being collected
 	}
 	r.state = Leader
+	r.obsState.Store(int32(Leader))
 	lastIndex, _ := r.log.LastIndexAndTerm()
 	next := make(map[string]uint64)
 	match := make(map[string]uint64)
@@ -431,8 +477,10 @@ func (r *RaftNode) becomeLeader(term uint64) {
 func (r *RaftNode) becomeFollowerLocked(term uint64) {
 	wasLeader := r.state == Leader
 	r.persisted.CurrentTerm = term
+	r.obsTerm.Store(term)
 	r.persisted.VotedFor = ""
 	r.state = Follower
+	r.obsState.Store(int32(Follower))
 	r.leader = nil
 	SavePersistentState(r.dataDir, r.persisted) // best-effort here; the critical path (vote granting) persists explicitly before replying
 	if wasLeader && r.stepDownC != nil {
@@ -479,7 +527,7 @@ func (r *RaftNode) replicateToAllPeers() {
 // heartbeats ARE just empty AppendEntries, so unifying them here isn't a
 // simplification, it's what the protocol actually does.
 func (r *RaftNode) replicateToPeer(peer string) {
-	r.mu.Lock()
+	r.lockTimed(&r.inReplicateWait)
 	if r.state != Leader || r.leader == nil {
 		r.mu.Unlock()
 		return
@@ -518,7 +566,7 @@ func (r *RaftNode) replicateToPeer(peer string) {
 		return // dropped/timed-out -- next heartbeat tick will retry
 	}
 
-	r.mu.Lock()
+	r.lockTimed(&r.inReplicateWait)
 	defer r.mu.Unlock()
 	if r.stopped || r.state != Leader || r.persisted.CurrentTerm != term || r.leader == nil {
 		return // stale response for a round we're no longer in
@@ -606,6 +654,7 @@ func (r *RaftNode) maybeAdvanceCommitIndexLocked() {
 		}
 		if count >= len(r.peers)/2+1 {
 			r.volatile.CommitIndex = n
+			r.obsCommit.Store(n)
 			select {
 			case r.commitC <- n:
 			default: // applier is already going to pick up the latest value; no need to block or queue
@@ -656,7 +705,8 @@ func (r *RaftNode) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse
 // replication handler -- see replicateToPeer's doc for why those are the
 // same RPC.
 func (r *RaftNode) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
-	r.mu.Lock()
+	r.noteAEArrival()
+	r.lockTimed(&r.inHandleAEWait)
 	defer r.mu.Unlock()
 
 	if req.Term < r.persisted.CurrentTerm {
@@ -715,6 +765,7 @@ func (r *RaftNode) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRe
 		}
 		if newCommit > r.volatile.CommitIndex {
 			r.volatile.CommitIndex = newCommit
+			r.obsCommit.Store(newCommit)
 			select {
 			case r.commitC <- newCommit:
 			default:
@@ -762,7 +813,7 @@ func (r *RaftNode) findConflictLocked(prevLogIndex uint64) (conflictIndex, confl
 // leader -- callers are expected to retry against whichever node the
 // cluster reports as leader.
 func (r *RaftNode) Propose(command []byte) (index uint64, term uint64, ok bool) {
-	r.mu.Lock()
+	r.lockTimed(&r.inProposeWait)
 	if r.state != Leader {
 		r.mu.Unlock()
 		return 0, 0, false
@@ -776,6 +827,7 @@ func (r *RaftNode) Propose(command []byte) (index uint64, term uint64, ok bool) 
 	if len(r.peers) == 0 {
 		// Single-node cluster: this node's own log IS the majority.
 		r.volatile.CommitIndex = entry.Index
+		r.obsCommit.Store(entry.Index)
 		select {
 		case r.commitC <- entry.Index:
 		default:
