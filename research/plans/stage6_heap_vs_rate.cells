@@ -1,0 +1,12 @@
+# stage 6: peak heap vs offered rate with one follower at constant 40 ms fsync delay (fast quorum available), enforce=1.
+# PREDICTION written before any stage 6 run (from stage 1 and 2 only): if memory comes from each proposal's replication
+# goroutine resending the whole unacknowledged suffix, peak heap grows about quadratically in rate. anchoring on
+# ~350 MB at 200/s (stage 2, 20 s runs) the prediction is roughly: 100/s ~90 MB, 300/s ~800 MB, 400/s ~1400 MB,
+# 500/s ~2200 MB (stage 1 measured ~1900 MB), 700/s above the 3000 MB guard. the prediction fails if heap grows
+# about linearly with rate (100/s above ~175 MB, 400/s below ~700 MB) or if 700/s stays under the guard in most runs.
+r0100  100  1 F1=40ms -
+r0200  200  1 F1=40ms -
+r0300  300  1 F1=40ms -
+r0400  400  1 F1=40ms -
+r0500  500  1 F1=40ms -
+r0700  700  1 F1=40ms -

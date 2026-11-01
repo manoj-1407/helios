@@ -1,0 +1,10 @@
+# stage 5: slow-ish leader (constant fsync delay d) swept across utilisation rho = rate*(d+~0.3ms).
+# stage 1 saw elections at d=10ms, rho~0.9; this checks whether elections and failed proposals rise with rho.
+d10_r050   48  1 L=10ms -
+d10_r070   68  1 L=10ms -
+d10_r090   87  1 L=10ms -
+d10_r100   97  1 L=10ms -
+d25_r050   20  1 L=25ms -
+d25_r070   28  1 L=25ms -
+d25_r090   36  1 L=25ms -
+d25_r100   40  1 L=25ms -
