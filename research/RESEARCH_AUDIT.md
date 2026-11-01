@@ -194,3 +194,39 @@ Not covered, and where I would look next:
 * Higher offered load, where the leader's fsync under `r.mu` (F13) should serialize proposals and heartbeats and could couple a slow node to election stability.
 * A real network and separate disks. Here the transport is in-process and all fsyncs hit one device, so the injected delay is the only asymmetry, which is cleaner than reality.
 * Whether this is new. It is the textbook quorum result, reproduced on this implementation with a verified injection. It is a sanity result and a validated instrument, not a contribution; the literature gap is in the next experiments (slow-but-alive, interaction with background work), not in this one.
+
+## Round 8a: what an acknowledgement means, and where `r.mu` is held across storage
+
+### Acknowledgement semantics (read, then tested)
+
+Path of `POST /kv/put` (`store/kvserver.go`): decode JSON, `handlePut` calls `propose`, which calls `RaftNode.Propose` once and, if it returns `ok`, writes `{"status":"ok"}`. Nothing else is awaited. `Propose` (`raft/raft.go`) takes `r.mu`, appends the entry to the leader's own log, which writes and fsyncs, releases `r.mu`, starts one replication goroutine per peer without waiting for them, and returns the index and term.
+
+So an `ok` from the server means exactly this: the node that believed itself leader at that instant has durably appended the entry to its own Raft log. It does not mean replicated, committed, applied or visible. The bench's "ack" latency is the same event (Propose returning), and its "commit" latency is the later event `leader.CommitIndex() >= idx`, which `raft/commit_semantics_test.go` ties to a majority holding the entry. The server API has no commit-waiting mode; only the bench clients wait for commit, by polling the leader.
+
+The consequence is demonstrated, not just argued: `chaos/ack_semantics_test.go` isolates the leader, writes through it (it acknowledges), lets the other two nodes elect a new leader and commit a different write, then heals the partition. The acknowledged write is gone from every node. This is standard for acknowledge-after-local-append, but it means the Helios API as built offers no durability guarantee beyond one machine, and reads (`/kv/get` reads the local JVM) can miss an acknowledged write for as long as apply lags (up to about 18 s after load in the Round 6 runs; read-after-write was not itself tested).
+
+In Round 7 the "1 ms ack, 42 ms commit" result for slow followers is therefore exactly the semantics above and not an instrumentation error: the leader's own fsync was fast, so it acknowledged immediately, and the write committed only when a slow follower caught up.
+
+### Where `r.mu` is held across storage (read)
+
+| code | holds `r.mu` while | affected by my injected delay |
+|---|---|---|
+| `Propose` | appending and fsyncing the leader's log | yes |
+| `HandleAppendEntries` | `log.TruncateFrom` and `log.Append` (both fsync) | `Append` yes, `TruncateFrom` no |
+| `HandleRequestVote` | `SavePersistentState` (write, fsync, rename of the term/vote file) | no |
+| `runElection` | `SavePersistentState` | no |
+| `becomeFollowerLocked` | `SavePersistentState` | no |
+
+Everything else that needs the same mutex therefore queues behind a slow fsync on that node: `State()`, `Term()`, `CommitIndex()`, the election timer callback `onElectionTimeout`, `HandlePreVote`, `HandleRequestVote`, and, on the leader, every `replicateToAllPeers` and `replicateToPeer` call (each takes `r.mu` at the start and again to process the reply), including the periodic heartbeat. Heartbeats are not a separate path: the heartbeat loop calls the same `replicateToAllPeers`. So a leader whose log fsync takes longer than a heartbeat interval cannot send heartbeats while it is stalled, and a leader stalled for longer than a follower's election timeout (150 to 300 ms by default) leaves followers with nothing to reset their timers. That is the coupling the experiments below test. Many production Raft implementations keep disk writes off the heartbeat path; this implementation does not.
+
+Two limits of my injection follow from the table. It only delays `Append` fsyncs, so the vote and term persistence paths, which a real slow device would also slow, are not delayed. And `lastHeartbeatSeen` and the election timer are reset inside `HandleAppendEntries` after the handler has acquired `r.mu`, so a follower stalled on its own fsync cannot reset its timer while stalled.
+
+Two further code facts that shape the experiments. First, `ChannelTransport` by default runs the handler synchronously and ignores the caller's deadline, so a slow handler can never produce an RPC timeout; the transport now has a `SetEnforceDeadlines` switch (tested in `raft/fsync_injection_test.go`) that makes it behave like a network RPC with the 100 ms `RPCTimeout`. Experiments about "delays above the RPC timeout" are only meaningful with it on, and all stages use it on except where a cell says otherwise. Second, pre-vote exists (`raft/prevote.go`) and should stop a lone slow node from inflating terms; whether it does under these conditions is part of what is measured.
+
+### Observer effect, fixed
+
+The first version of the Raft-only load generator read commit index, term and leader state through `RaftNode` accessors that take `r.mu`, i.e. through the lock under study, so a stalled node would also stall the observers and the stall would be under-counted. `RaftNode` now keeps lock-free mirrors of state, term and commit index (`ObservedState`, `ObservedTerm`, `ObservedCommit`), written next to each mutation, and the generator uses only those. Whether a write that was counted as committed is the entry that actually committed at its index is checked after the run, with injections cleared.
+
+### Stage 0: capacity of the Raft-only leader (no delay)
+
+`research/plans/stage0_capacity.cells`, three runs per rate, 12 s each, `results/raftload_stage0_capacity.csv`. Commit p50 stays at 1.1 to 1.5 ms up to 2,000 writes/s with a p99 that grows from about 5 ms (200/s) to 11 to 22 ms (2,000/s). At 4,000 offered the leader achieves about 3,000 writes/s and commit latency is in the seconds (a queue is growing). At 8,000 and 16,000 offered, achieved throughput falls to about 1,000 to 2,200 writes/s, lower than at 4,000: past saturation the implementation loses throughput, probably from its unbounded one-goroutine-per-peer-per-proposal replication and the generator's own cost on 2 vCPUs. I did not isolate that. Load levels for later stages were fixed from this table before any delay results existed: 500 (low), 2,000 (near the knee), 3,000 (past it) writes/s.

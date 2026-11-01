@@ -1,0 +1,8 @@
+# stage 0: leader capacity with no injected delay, raft only. rates in writes/s.
+r0200  200   1 - -
+r0500  500   1 - -
+r1000  1000  1 - -
+r2000  2000  1 - -
+r4000  4000  1 - -
+r8000  8000  1 - -
+r16000 16000 1 - -

@@ -1,0 +1,12 @@
+# stage 1 (H-A): commit latency vs offered load and constant fsync delay. enforce=1 (100 ms rpc timeout).
+# load levels fixed after stage 0: 500 (low), 2000 (near the knee), 3000 (past it).
+# leader-delay cells use utilisation rho = rate * (delay + ~0.3 ms fsync): d=10ms -> 24/48/87 writes/s (rho ~0.25/0.5/0.9)
+none_500    500   1 -        -
+none_2000   2000  1 -        -
+none_3000   3000  1 -        -
+F1d40_500   500   1 F1=40ms  -
+F1d40_2000  2000  1 F1=40ms  -
+F1d40_3000  3000  1 F1=40ms  -
+Ld10_24     24    1 L=10ms   -
+Ld10_48     48    1 L=10ms   -
+Ld10_87     87    1 L=10ms   -
