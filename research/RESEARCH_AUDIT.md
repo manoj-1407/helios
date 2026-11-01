@@ -158,3 +158,39 @@ What it does not establish:
 * Commit latency here is closed loop with 32 clients; its ~12 ms median is mostly queueing on the leader's serialized fsync (finding F13, untested). That is why the quorum-masking experiment is open loop.
 
 Write amplification, resolved enough to use: engine write amplification as defined in Round 5 (flush bytes plus compaction output bytes over logical bytes, counters read after the drain) is stable at 6.3 to 7.0 across compacting runs and 1.01 without compaction. The bench's own `WriteAmplification` field (follower 1, forced flush) should still not be used.
+
+## Round 7: quorum masking (E1), open loop
+
+Code: `bench/quorum.go` (`RunQuorum`), driver `research/cmd/quorum`, fsync injection in `raft/log.go` (`SetFsyncDelay`, with per-node counters and a unit test, `raft/fsync_injection_test.go`). Setup: 3 nodes, in-process transport, three JVMs (FORCE_LEVELED; the legacy 200-key workload never compacts, so compaction is not a variable here), pure writes, **open loop at 15 writes/s** with latency measured from each arrival's intended send time, 30 s of arrivals per run with the first 5 s discarded (375 measured writes per run), 9 cells x 4 randomized blocks = 36 runs, seeded order. Raw data: `results/quorum_masking_v1.csv`.
+
+Roles are assigned after the election: L is the leader and F1 and F2 are the other two nodes in id order. The delay is slept before the real fsync inside `RaftLog.Append`, so it is paid under the same locks a slow device would be.
+
+Checks that the experiment did what it says: 0 failed proposals, 0 unfinished writes, no leader change in any of the 36 runs, exactly 375 measured writes in every run. The injected delay was reached: in every run, `injected_ms` on each slow node equals its sync count times the delay (within 10%) and is exactly 0 on the others, and the slow node's mean sync time is the delay plus about 0.3 ms of real fsync. Zero mismatches in 36 runs.
+
+Means over 4 runs per cell with 95% t-intervals (n=4, rough):
+
+| slow node(s) | injected delay | commit p50 ms | commit p99 ms | client-ack p50 ms |
+|---|---|---|---|---|
+| none | 0 | 1.47 ±0.05 | 2.81 ±0.69 | 1.10 ±0.08 |
+| one follower | 10 ms | 1.38 ±0.10 | 3.55 ±1.43 | 1.04 ±0.05 |
+| one follower | 40 ms | 1.36 ±0.07 | 3.34 ±1.62 | 1.04 ±0.06 |
+| leader | 10 ms | 11.74 ±0.07 | 13.77 ±1.07 | 11.37 ±0.03 |
+| leader | 40 ms | 42.09 ±0.04 | 44.11 ±1.14 | 41.67 ±0.03 |
+| leader + one follower | 10 ms | 11.71 ±0.13 | 13.17 ±0.55 | 11.39 ±0.11 |
+| leader + one follower | 40 ms | 42.02 ±0.09 | 43.68 ±0.82 | 41.66 ±0.07 |
+| both followers | 10 ms | 11.94 ±0.05 | 13.95 ±0.83 | 1.05 ±0.06 |
+| both followers | 40 ms | 42.15 ±0.13 | 45.53 ±3.24 | 1.00 ±0.08 |
+
+Reading:
+
+* H1 (quorum masking) held in this setup. One slow follower, at 10 ms and at 40 ms, leaves commit p50 unchanged (1.4 ms) and commit p99 within noise of baseline (3.3 to 3.6 ms against 2.8 ms, intervals overlapping). The pre-registered drop criterion in `HYPOTHESES.md` (a single slow follower raising commit p99 by more than 20% with non-overlapping intervals) was not met. The mean p99 is 19% to 26% higher, which is why I am not calling it "no effect": with 375 samples per run and n=4 the p99 estimate is too coarse to exclude a sub-millisecond tail effect.
+* Commit latency rises by roughly the injected delay whenever no fast majority exists: slow leader, slow leader plus one follower, or both followers slow. This is the quorum arithmetic and is what the model predicts: commit needs the leader's own fsync plus one follower's.
+* Client-ack latency and commit latency come apart exactly where the audit said they would (F1). With both followers slow, the client sees a ~1 ms acknowledgement while the write takes ~42 ms to commit. A benchmark that stops the clock at the acknowledgement would report "no effect" there.
+* No queueing built up: at most 1 to 2 writes in flight and apply backlog of at most 2 entries in any run. The offered load is deliberately far below capacity, so this experiment says nothing about saturation behaviour.
+
+Not covered, and where I would look next:
+
+* Delays at or above the 100 ms RPC timeout (a very slow follower then looks dead to the leader), delays that vary over time, and partial slowness (only some fsyncs slow). These are where "slow but alive" differs from "uniformly slow".
+* Higher offered load, where the leader's fsync under `r.mu` (F13) should serialize proposals and heartbeats and could couple a slow node to election stability.
+* A real network and separate disks. Here the transport is in-process and all fsyncs hit one device, so the injected delay is the only asymmetry, which is cleaner than reality.
+* Whether this is new. It is the textbook quorum result, reproduced on this implementation with a verified injection. It is a sanity result and a validated instrument, not a contribution; the literature gap is in the next experiments (slow-but-alive, interaction with background work), not in this one.

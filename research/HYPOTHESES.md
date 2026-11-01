@@ -19,6 +19,7 @@ Each has a prediction that could fail, a number that would make me drop it, and 
 Prediction: with injected fsync delay `d` on the Raft log device of one follower, commit p99 stays within noise of the no-fault baseline for any `d`. With the same delay on the leader and one follower, commit p99 rises with `d`.
 Drop if: the single-slow-follower case raises commit p99 by more than 20% over baseline with non-overlapping bootstrap CIs. That would mean something other than quorum arithmetic couples followers to the leader (leader-side goroutine pile-up, `r.mu` held across fsync, the 100 ms RPC timeout).
 Test: E1.
+Status (2026-11-01): **held** for one slow follower at 10 and 40 ms, 15 writes/s open loop, 36 runs (`RESEARCH_AUDIT.md`, Round 7). Not tested at delays near or above the RPC timeout, under load, or with a real network.
 
 ### H2: synchronized maintenance
 
