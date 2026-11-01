@@ -36,6 +36,7 @@ type LoadSpec struct {
 	Delay            map[string]time.Duration
 	Stall            map[string]StallSpec
 	EnforceDeadlines bool // network-like RPC deadlines in the in-process transport
+	SingleFlight     bool // raft.Config.SingleFlightReplication
 	MaxInFlight      int  // arrivals beyond this many unfinished writes are dropped (default 20000)
 	MemLimitMB       int  // abort the run if the Go heap exceeds this (default 3000); the result is flagged MemAbort
 	Seed             int64
@@ -111,7 +112,9 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 			return res, err
 		}
 		dirs = append(dirs, dir)
-		n, err := raft.NewRaftNode(id, peers, dir, transport, nullSM{}, raft.DefaultConfig())
+		cfg := raft.DefaultConfig()
+		cfg.SingleFlightReplication = spec.SingleFlight
+		n, err := raft.NewRaftNode(id, peers, dir, transport, nullSM{}, cfg)
 		if err != nil {
 			return res, err
 		}
@@ -331,6 +334,11 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		res.TermEnd = l.Term()
 	}
 	res.MaxInFlight = maxInFlight
+	for role, n := range roles {
+		c, tot, inj := n.FsyncStats()
+		st, mx := n.FsyncDetail()
+		res.Role[role] = RoleStats{Instr: n.Instrumentation(), Syncs: c, SyncTotalNs: tot, InjectedNs: inj, Stalls: st, SyncMaxNs: mx}
+	}
 	// clear injections, let the cluster settle, then check that each write the
 	// watcher counted as committed is the entry that actually committed at its
 	// index; if a different term's entry sits there the write was lost.
@@ -387,11 +395,6 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		res.LeaderChanges += in.LeaderChanges - b.LeaderChanges
 		res.Elections += in.ElectionsStarted - b.ElectionsStarted
 		res.PreVotes += in.PreVotesStarted - b.PreVotesStarted
-	}
-	for role, n := range roles {
-		c, tot, inj := n.FsyncStats()
-		st, mx := n.FsyncDetail()
-		res.Role[role] = RoleStats{Instr: n.Instrumentation(), Syncs: c, SyncTotalNs: tot, InjectedNs: inj, Stalls: st, SyncMaxNs: mx}
 	}
 	return res, nil
 }

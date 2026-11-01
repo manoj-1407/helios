@@ -20,6 +20,14 @@ type Config struct {
 	ElectionTimeoutSpread time.Duration
 	HeartbeatInterval     time.Duration
 	RPCTimeout            time.Duration
+
+	// SingleFlightReplication allows at most one AppendEntries call in flight per
+	// peer; a call that arrives while one is outstanding returns immediately and
+	// the next heartbeat or proposal retries. Off by default: the original
+	// behaviour spawns one call per proposal per peer with no bound. It exists so
+	// experiments can test whether that unboundedness is the cause of the
+	// slow-follower memory growth (research/RESEARCH_AUDIT.md).
+	SingleFlightReplication bool
 }
 
 func DefaultConfig() Config {
@@ -108,6 +116,7 @@ type RaftNode struct {
 	// lock-free mirrors of state, term and commit index, written next to every
 	// mutation under r.mu. observers (load generators, samplers) read these so
 	// they never contend on r.mu, the lock under study.
+	peerBusy  map[string]*atomic.Bool
 	obsState  atomic.Int32
 	obsTerm   atomic.Uint64
 	obsCommit atomic.Uint64
@@ -148,6 +157,10 @@ func NewRaftNode(id string, peers []string, dataDir string, transport Transport,
 		RepMetrics: NewReplicationMetrics(),
 	}
 	n.obsTerm.Store(persisted.CurrentTerm)
+	n.peerBusy = make(map[string]*atomic.Bool, len(peers))
+	for _, p := range peers {
+		n.peerBusy[p] = new(atomic.Bool)
+	}
 	return n, nil
 }
 
@@ -527,6 +540,13 @@ func (r *RaftNode) replicateToAllPeers() {
 // heartbeats ARE just empty AppendEntries, so unifying them here isn't a
 // simplification, it's what the protocol actually does.
 func (r *RaftNode) replicateToPeer(peer string) {
+	if r.cfg.SingleFlightReplication {
+		busy := r.peerBusy[peer]
+		if !busy.CompareAndSwap(false, true) {
+			return
+		}
+		defer busy.Store(false)
+	}
 	r.lockTimed(&r.inReplicateWait)
 	if r.state != Leader || r.leader == nil {
 		r.mu.Unlock()

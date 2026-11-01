@@ -32,7 +32,8 @@ for rep in range(1, a.reps + 1):
     order = list(range(len(cells)))
     random.Random(a.seed * 100003 + rep).shuffle(order)
     for pos, idx in enumerate(order, 1):
-        label, rate, enforce, delays, stalls = cells[idx]
+        label, rate, enforce, delays, stalls = cells[idx][:5]
+        sf = cells[idx][5] if len(cells[idx]) > 5 else "0"
         cmd = [a.binary, "-cells", a.cells, "-single", str(idx), "-rep", str(rep), "-pos", str(pos),
                "-dur", f"{a.dur}s", "-warmup", f"{a.warmup}s", "-seed", str(a.seed)]
         try:
@@ -46,7 +47,7 @@ for rep in range(1, a.reps + 1):
         except subprocess.TimeoutExpired:
             status, row = "timeout", ""
         if not row:
-            fields = [str(rep), str(pos), label, rate, enforce, delays, stalls, f"{a.dur:.0f}"]
+            fields = [str(rep), str(pos), label, rate, enforce, sf, delays, stalls, f"{a.dur:.0f}"]
             row = ",".join(fields + [""] * (ncols - len(fields)))
         out.write(f"{status},{row}\n"); out.flush()
         print(f"[run_plan] rep {rep} pos {pos} {label} {status}", file=sys.stderr, flush=True)

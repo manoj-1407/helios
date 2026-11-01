@@ -2,12 +2,13 @@
 //
 // each non-comment line of the cells file is
 //
-//	label rate enforce delays stalls
+//	label rate enforce delays stalls [singleflight]
 //
 // rate     offered writes/s (open loop)
 // enforce  0 or 1: honour rpc deadlines in the in-process transport
 // delays   "-" or ROLE=dur[,ROLE=dur]   constant fsync delay, e.g. F1=40ms,L=10ms
 // stalls   "-" or ROLE=p/dur[,...]      intermittent stall, e.g. F1=0.05/300ms
+// singleflight  optional 0/1: raft.Config.SingleFlightReplication (default 0)
 //
 // roles are L (leader after the initial election), F1 and F2 (the other nodes in
 // id order). every rep runs every cell once in a seeded random order.
@@ -32,6 +33,7 @@ type cell struct {
 	label   string
 	rate    float64
 	enforce bool
+	single  bool
 	delays  map[string]time.Duration
 	stalls  map[string]bench.StallSpec
 	dtxt    string
@@ -52,8 +54,8 @@ func parseCells(path string) ([]cell, error) {
 			continue
 		}
 		fs := strings.Fields(line)
-		if len(fs) != 5 {
-			return nil, fmt.Errorf("bad cell line %q (want 5 fields)", line)
+		if len(fs) != 5 && len(fs) != 6 {
+			return nil, fmt.Errorf("bad cell line %q (want 5 or 6 fields)", line)
 		}
 		rate, err := strconv.ParseFloat(fs[1], 64)
 		if err != nil {
@@ -61,6 +63,7 @@ func parseCells(path string) ([]cell, error) {
 		}
 		c := cell{label: fs[0], rate: rate, enforce: fs[2] == "1", dtxt: fs[3], stxt: fs[4],
 			delays: map[string]time.Duration{}, stalls: map[string]bench.StallSpec{}}
+		c.single = len(fs) == 6 && fs[5] == "1"
 		if fs[3] != "-" {
 			for _, kv := range strings.Split(fs[3], ",") {
 				p := strings.SplitN(kv, "=", 2)
@@ -108,7 +111,7 @@ func main() {
 		os.Exit(2)
 	}
 	rng := rand.New(rand.NewSource(*seed))
-	hdr := "rep,pos,label,rate,enforce,delays,stalls,dur_s,leader_start,leader_end,offered,issued,dropped,gen_slip_max_ms,measured,failed,lost,unfinished,achieved_per_s," +
+	hdr := "rep,pos,label,rate,enforce,singleflight,delays,stalls,dur_s,leader_start,leader_end,offered,issued,dropped,gen_slip_max_ms,measured,failed,lost,unfinished,achieved_per_s," +
 		"ack_p50_ms,ack_p99_ms,commit_p50_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,max_inflight,no_leader_frac,term_start,term_end,leader_changes,elections,prevotes,peak_heap_mb,peak_goroutines,mem_abort"
 	for _, r := range []string{"L", "F1", "F2"} {
 		hdr += fmt.Sprintf(",%[1]s_syncs,%[1]s_injected_ms,%[1]s_stalls,%[1]s_sync_max_ms,%[1]s_propose_wait_max_ms,%[1]s_repl_wait_max_ms,%[1]s_handleae_wait_max_ms,%[1]s_handleae_wait_ge100,%[1]s_aegap_max_ms,%[1]s_aegap_ge100", r)
@@ -132,17 +135,21 @@ func main() {
 			}
 			c := cells[idx]
 			r, err := bench.RunRaftLoad(bench.LoadSpec{Label: c.label, Rate: c.rate, Duration: *dur, Warmup: *warm,
-				Delay: c.delays, Stall: c.stalls, EnforceDeadlines: c.enforce, Seed: *seed*1000 + int64(rep)})
+				Delay: c.delays, Stall: c.stalls, EnforceDeadlines: c.enforce, SingleFlight: c.single, Seed: *seed*1000 + int64(rep)})
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "run failed:", err)
 				os.Exit(1)
+			}
+			sfi := 0
+			if c.single {
+				sfi = 1
 			}
 			enf := 0
 			if c.enforce {
 				enf = 1
 			}
-			fmt.Printf("%d,%d,%s,%.0f,%d,%s,%s,%.0f,%s,%s,%d,%d,%d,%.2f,%d,%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.4f,%d,%d,%d,%d,%d",
-				rep, pos+1, c.label, c.rate, enf, c.dtxt, c.stxt, dur.Seconds(), r.LeaderStart, r.LeaderEnd,
+			fmt.Printf("%d,%d,%s,%.0f,%d,%d,%s,%s,%.0f,%s,%s,%d,%d,%d,%.2f,%d,%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.4f,%d,%d,%d,%d,%d",
+				rep, pos+1, c.label, c.rate, enf, sfi, c.dtxt, c.stxt, dur.Seconds(), r.LeaderStart, r.LeaderEnd,
 				r.Offered, r.Issued, r.Dropped, ms(r.GenSlipMaxNs), r.Measured, r.Failed, r.Lost, r.Unfinished, r.AchievedPerSec,
 				ms(r.AckP50Ns), ms(r.AckP99Ns), ms(r.CommitP50Ns), ms(r.CommitP95Ns), ms(r.CommitP99Ns), ms(r.CommitMaxNs),
 				r.MaxInFlight, r.NoLeaderFrac, r.TermStart, r.TermEnd, r.LeaderChanges, r.Elections, r.PreVotes)

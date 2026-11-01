@@ -1,0 +1,9 @@
+# stage 2a: is unbounded per-peer replication the cause of the slow-follower memory blow-up (stage 1, F1d40)?
+# intervention: raft.Config.SingleFlightReplication (6th field). same follower delay and loads as stage 1.
+off_F1d40_500   500   1 F1=40ms -  0
+on_F1d40_500    500   1 F1=40ms -  1
+off_F1d40_2000  2000  1 F1=40ms -  0
+on_F1d40_2000   2000  1 F1=40ms -  1
+# controls: does the option change healthy behaviour?
+on_none_500     500   1 -        -  1
+on_none_2000    2000  1 -        -  1
