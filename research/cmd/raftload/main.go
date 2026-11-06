@@ -2,13 +2,14 @@
 //
 // each non-comment line of the cells file is
 //
-//	label rate enforce delays stalls [singleflight]
+//	label rate enforce delays stalls [singleflight [appendoutside]]
 //
 // rate     offered writes/s (open loop)
 // enforce  0 or 1: honour rpc deadlines in the in-process transport
 // delays   "-" or ROLE=dur[,ROLE=dur]   constant fsync delay, e.g. F1=40ms,L=10ms
 // stalls   "-" or ROLE=p/dur[,...]      intermittent stall, e.g. F1=0.05/300ms
 // singleflight  optional 0/1: raft.Config.SingleFlightReplication (default 0)
+// appendoutside optional 0/1: raft.Config.AppendOutsideLock (default 0); needs the singleflight field present
 //
 // roles are L (leader after the initial election), F1 and F2 (the other nodes in
 // id order). every rep runs every cell once in a seeded random order.
@@ -34,6 +35,7 @@ type cell struct {
 	rate    float64
 	enforce bool
 	single  bool
+	ao      bool // 7th field: raft.Config.AppendOutsideLock
 	delays  map[string]time.Duration
 	stalls  map[string]bench.StallSpec
 	dtxt    string
@@ -54,8 +56,8 @@ func parseCells(path string) ([]cell, error) {
 			continue
 		}
 		fs := strings.Fields(line)
-		if len(fs) != 5 && len(fs) != 6 {
-			return nil, fmt.Errorf("bad cell line %q (want 5 or 6 fields)", line)
+		if len(fs) < 5 || len(fs) > 7 {
+			return nil, fmt.Errorf("bad cell line %q (want 5 to 7 fields)", line)
 		}
 		rate, err := strconv.ParseFloat(fs[1], 64)
 		if err != nil {
@@ -63,7 +65,8 @@ func parseCells(path string) ([]cell, error) {
 		}
 		c := cell{label: fs[0], rate: rate, enforce: fs[2] == "1", dtxt: fs[3], stxt: fs[4],
 			delays: map[string]time.Duration{}, stalls: map[string]bench.StallSpec{}}
-		c.single = len(fs) == 6 && fs[5] == "1"
+		c.single = len(fs) >= 6 && fs[5] == "1"
+		c.ao = len(fs) == 7 && fs[6] == "1"
 		if fs[3] != "-" {
 			for _, kv := range strings.Split(fs[3], ",") {
 				p := strings.SplitN(kv, "=", 2)
@@ -116,6 +119,7 @@ func main() {
 	for _, r := range []string{"L", "F1", "F2"} {
 		hdr += fmt.Sprintf(",%[1]s_syncs,%[1]s_injected_ms,%[1]s_stalls,%[1]s_sync_max_ms,%[1]s_propose_wait_max_ms,%[1]s_repl_wait_max_ms,%[1]s_handleae_wait_max_ms,%[1]s_handleae_wait_ge100,%[1]s_aegap_max_ms,%[1]s_aegap_ge100", r)
 	}
+	hdr += ",appendoutside,L_propose_hold_max_ms,L_propose_hold_sum_ms,L_propose_hold_n,L_propose_wait_sum_ms,L_repl_wait_sum_ms,L_sendgap_max_ms,L_sendgap_ge100,L_sendgap_ge50"
 	if *hdrOnly {
 		fmt.Println(hdr)
 		return
@@ -135,7 +139,7 @@ func main() {
 			}
 			c := cells[idx]
 			r, err := bench.RunRaftLoad(bench.LoadSpec{Label: c.label, Rate: c.rate, Duration: *dur, Warmup: *warm,
-				Delay: c.delays, Stall: c.stalls, EnforceDeadlines: c.enforce, SingleFlight: c.single, Seed: *seed*1000 + int64(rep)})
+				Delay: c.delays, Stall: c.stalls, EnforceDeadlines: c.enforce, SingleFlight: c.single, AppendOutside: c.ao, Seed: *seed*1000 + int64(rep)})
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "run failed:", err)
 				os.Exit(1)
@@ -164,6 +168,16 @@ func main() {
 					ms(s.ProposeLockWait.MaxNs), ms(s.ReplicateLockWait.MaxNs), ms(s.HandleAELockWait.MaxNs),
 					s.HandleAELockWait.Buckets[5]+s.HandleAELockWait.Buckets[6],
 					ms(s.AEGap.MaxNs), s.AEGap.Buckets[5]+s.AEGap.Buckets[6])
+			}
+			{
+				l := r.Role["L"]
+				ao := 0
+				if c.ao {
+					ao = 1
+				}
+				fmt.Printf(",%d,%.2f,%.2f,%d,%.1f,%.1f,%.2f,%d,%d", ao, ms(l.ProposeLockHold.MaxNs), ms(l.ProposeLockHold.SumNs), l.ProposeLockHold.Count,
+					ms(l.ProposeLockWait.SumNs), ms(l.ReplicateLockWait.SumNs), ms(l.SendGap.MaxNs),
+					l.SendGap.Buckets[5]+l.SendGap.Buckets[6], l.SendGap.Buckets[4]+l.SendGap.Buckets[5]+l.SendGap.Buckets[6])
 			}
 			fmt.Println()
 			fmt.Fprintf(os.Stderr, "[raftload] rep %d pos %d %s done\n", rep, pos+1, c.label)

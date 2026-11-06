@@ -1,0 +1,12 @@
+# lock-scope intervention, primary. ao=0 baseline, ao=1 fsync outside r.mu and the log mutex. see research/LOCK_SCOPE_PREREG.md
+# fields: label rate enforce delays stalls singleflight appendoutside
+ctl_ao0   48   1 -       - 0 0
+ctl_ao1   48   1 -       - 0 1
+r050_ao0  48   1 L=10ms  - 0 0
+r050_ao1  48   1 L=10ms  - 0 1
+r090_ao0  87   1 L=10ms  - 0 0
+r090_ao1  87   1 L=10ms  - 0 1
+r100_ao0  97   1 L=10ms  - 0 0
+r100_ao1  97   1 L=10ms  - 0 1
+r120_ao0  116  1 L=10ms  - 0 0
+r120_ao1  116  1 L=10ms  - 0 1

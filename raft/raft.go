@@ -28,6 +28,14 @@ type Config struct {
 	// experiments can test whether that unboundedness is the cause of the
 	// slow-follower memory growth (research/RESEARCH_AUDIT.md).
 	SingleFlightReplication bool
+
+	// AppendOutsideLock is the lock-scope intervention for research/LOCK_SCOPE_PREREG.md.
+	// Off (default): Propose holds r.mu, and the log's own mutex, across the leader's
+	// fsync. On: Propose writes the entry under r.mu (same index and term as before),
+	// releases r.mu, then fsyncs; replication and the leader's own commit vote use only
+	// entries at or below the log's durable index, and Propose returns only after its
+	// entry is durable. Followers' AppendEntries path is not changed.
+	AppendOutsideLock bool
 }
 
 func DefaultConfig() Config {
@@ -110,6 +118,7 @@ type RaftNode struct {
 
 	// instrumentation (instrument.go)
 	inProposeWait, inReplicateWait, inHandleAEWait, inAEGap waitStats
+	inProposeHold, inSendGap                                waitStats // r.mu hold time in Propose; gap between successive AppendEntries sends to the same peer
 	inLastAE                                                atomic.Int64
 	inPreVotes, inElections                                 atomic.Int64
 
@@ -117,6 +126,7 @@ type RaftNode struct {
 	// mutation under r.mu. observers (load generators, samplers) read these so
 	// they never contend on r.mu, the lock under study.
 	peerBusy  map[string]*atomic.Bool
+	peerSend  map[string]*atomic.Int64 // unix ns of the last AppendEntries send per peer (instrumentation)
 	obsState  atomic.Int32
 	obsTerm   atomic.Uint64
 	obsCommit atomic.Uint64
@@ -142,15 +152,15 @@ func NewRaftNode(id string, peers []string, dataDir string, transport Transport,
 	}
 
 	n := &RaftNode{
-		id:        id,
-		peers:     peers,
-		cfg:       cfg.withDefaults(),
-		state:     Follower,
-		persisted: persisted,
-		log:       log,
-		transport: transport,
-		sm:        sm,
-		dataDir:   dataDir,
+		id:         id,
+		peers:      peers,
+		cfg:        cfg.withDefaults(),
+		state:      Follower,
+		persisted:  persisted,
+		log:        log,
+		transport:  transport,
+		sm:         sm,
+		dataDir:    dataDir,
 		commitC:    make(chan uint64, 1),
 		stopC:      make(chan struct{}),
 		metrics:    newRaftMetrics(),
@@ -158,8 +168,10 @@ func NewRaftNode(id string, peers []string, dataDir string, transport Transport,
 	}
 	n.obsTerm.Store(persisted.CurrentTerm)
 	n.peerBusy = make(map[string]*atomic.Bool, len(peers))
+	n.peerSend = make(map[string]*atomic.Int64, len(peers))
 	for _, p := range peers {
 		n.peerBusy[p] = new(atomic.Bool)
+		n.peerSend[p] = new(atomic.Int64)
 	}
 	return n, nil
 }
@@ -565,12 +577,20 @@ func (r *RaftNode) replicateToPeer(peer string) {
 		return
 	}
 	lastIndex, _ := r.log.LastIndexAndTerm()
+	if r.cfg.AppendOutsideLock {
+		if d := r.log.DurableIndex(); d < lastIndex {
+			lastIndex = d // never ship an entry this node has not made durable
+		}
+	}
 	entries := r.log.Slice(nextIndex, lastIndex+1)
 	leaderCommit := r.volatile.CommitIndex
 	leaderID := r.id
 	r.mu.Unlock()
 
 	start := time.Now()
+	if prev := r.peerSend[peer].Swap(start.UnixNano()); prev != 0 {
+		r.inSendGap.record(time.Duration(start.UnixNano() - prev))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.RPCTimeout)
 	defer cancel()
 	resp, err := r.transport.SendAppendEntries(ctx, peer, AppendEntriesRequest{
@@ -667,6 +687,9 @@ func (r *RaftNode) maybeAdvanceCommitIndexLocked() {
 			continue
 		}
 		count := 1 // leader itself
+		if r.cfg.AppendOutsideLock && n > r.log.DurableIndex() {
+			count = 0 // the leader's own copy is not durable yet, so it does not vote
+		}
 		for _, peer := range r.peers {
 			if r.leader.MatchIndex[peer] >= n {
 				count++
@@ -833,7 +856,11 @@ func (r *RaftNode) findConflictLocked(prevLogIndex uint64) (conflictIndex, confl
 // leader -- callers are expected to retry against whichever node the
 // cluster reports as leader.
 func (r *RaftNode) Propose(command []byte) (index uint64, term uint64, ok bool) {
+	if r.cfg.AppendOutsideLock {
+		return r.proposeOutsideLock(command)
+	}
 	r.lockTimed(&r.inProposeWait)
+	held := time.Now()
 	if r.state != Leader {
 		r.mu.Unlock()
 		return 0, 0, false
@@ -854,10 +881,66 @@ func (r *RaftNode) Propose(command []byte) (index uint64, term uint64, ok bool) 
 		}
 	}
 	idx, t := entry.Index, entry.Term
+	r.inProposeHold.record(time.Since(held))
 	r.mu.Unlock()
 
 	r.replicateToAllPeers()
 	return idx, t, true
+}
+
+// proposeOutsideLock is Propose with the fsync moved out of r.mu. The entry gets
+// the same index and term it would get in the original path, because both are
+// chosen and written under r.mu. Only the fsync happens outside, serialised by the
+// log. The caller is told ok only once the entry is durable and still in the log.
+func (r *RaftNode) proposeOutsideLock(command []byte) (index uint64, term uint64, ok bool) {
+	r.lockTimed(&r.inProposeWait)
+	held := time.Now()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return 0, 0, false
+	}
+	lastIndex, _ := r.log.LastIndexAndTerm()
+	entry := LogEntry{Term: r.persisted.CurrentTerm, Index: lastIndex + 1, Command: command}
+	if err := r.log.AppendBuffered(entry); err != nil {
+		r.mu.Unlock()
+		return 0, 0, false
+	}
+	r.inProposeHold.record(time.Since(held))
+	r.mu.Unlock()
+
+	if err := r.log.SyncDurable(); err != nil {
+		return 0, 0, false
+	}
+
+	r.lockTimed(&r.inProposeWait)
+	held = time.Now()
+	// the entry may have been truncated by a newer leader while we were syncing
+	if cur, present := r.log.Get(entry.Index); !present || cur.Term != entry.Term || r.log.DurableIndex() < entry.Index {
+		r.inProposeHold.record(time.Since(held))
+		r.mu.Unlock()
+		return 0, 0, false
+	}
+	stillLeader := r.state == Leader && r.persisted.CurrentTerm == entry.Term
+	if stillLeader {
+		if len(r.peers) == 0 {
+			r.volatile.CommitIndex = entry.Index
+			r.obsCommit.Store(entry.Index)
+			select {
+			case r.commitC <- entry.Index:
+			default:
+			}
+		} else {
+			// followers may already have acknowledged this entry via a heartbeat
+			r.maybeAdvanceCommitIndexLocked()
+		}
+	}
+	r.inProposeHold.record(time.Since(held))
+	r.mu.Unlock()
+
+	if stillLeader {
+		r.replicateToAllPeers()
+	}
+	return entry.Index, entry.Term, true
 }
 
 // applyLoop watches for commitIndex advancing and applies every newly

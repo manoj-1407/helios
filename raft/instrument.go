@@ -60,6 +60,8 @@ type Instr struct {
 	ProposeLockWait   WaitSnapshot // time Propose waited for r.mu
 	ReplicateLockWait WaitSnapshot // time replicateToPeer waited for r.mu (start and response handling)
 	HandleAELockWait  WaitSnapshot // time HandleAppendEntries waited for r.mu
+	ProposeLockHold   WaitSnapshot // time Propose held r.mu (whole fsync in the original path)
+	SendGap           WaitSnapshot // gap between successive AppendEntries sends to the same peer (leader view)
 	AEGap             WaitSnapshot // gap between consecutive AppendEntries arrivals at this node (follower view)
 	PreVotesStarted   int64
 	ElectionsStarted  int64
@@ -72,6 +74,8 @@ func (r *RaftNode) Instrumentation() Instr {
 		ProposeLockWait:   r.inProposeWait.snapshot(),
 		ReplicateLockWait: r.inReplicateWait.snapshot(),
 		HandleAELockWait:  r.inHandleAEWait.snapshot(),
+		ProposeLockHold:   r.inProposeHold.snapshot(),
+		SendGap:           r.inSendGap.snapshot(),
 		AEGap:             r.inAEGap.snapshot(),
 		PreVotesStarted:   r.inPreVotes.Load(),
 		ElectionsStarted:  r.inElections.Load(),

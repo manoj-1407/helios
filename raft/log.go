@@ -62,6 +62,16 @@ type RaftLog struct {
 	stallCount atomic.Int64
 	rngState   atomic.Uint64
 	syncMaxNs  atomic.Int64
+
+	// durable is the highest index known to be fsynced. Append (synchronous) keeps
+	// it equal to the last index. AppendBuffered + SyncDurable move it later, so
+	// with the experimental lock-scope option on, readers that need durable data
+	// (replication, the leader's own commit vote) must cap at DurableIndex().
+	// epoch is bumped by TruncateFrom so a sync that started before a truncation
+	// cannot mark entries written after it as durable.
+	durable atomic.Uint64
+	epoch   uint64     // guarded by mu
+	syncMu  sync.Mutex // serialises fsyncs of the buffered path; never held with mu
 }
 
 // SetFsyncStall makes each Append sync stall for d with probability p (0..1),
@@ -203,6 +213,7 @@ func (l *RaftLog) replay() error {
 			return fmt.Errorf("fsyncing after truncating torn record: %w", err)
 		}
 	}
+	l.durable.Store(l.entries[len(l.entries)-1].Index) // everything replayed came from disk
 	return nil
 }
 
@@ -211,13 +222,8 @@ func (l *RaftLog) replay() error {
 // whatever invariant ordering Raft requires (entries persisted before
 // replying to AppendEntries); this method itself just guarantees that
 // once it returns nil, the entries survive a crash.
-func (l *RaftLog) Append(entries ...LogEntry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+// writeLocked appends entries to the file and the in-memory log. Caller holds l.mu.
+func (l *RaftLog) writeLocked(entries []LogEntry) error {
 	offset, err := l.file.Seek(0, os.SEEK_END)
 	if err != nil {
 		return fmt.Errorf("seeking to end of log file: %w", err)
@@ -243,12 +249,61 @@ func (l *RaftLog) Append(entries ...LogEntry) error {
 		l.entries = append(l.entries, e)
 		offset += int64(logRecordHeaderSize) + int64(len(e.Command))
 	}
+	return nil
+}
 
+func (l *RaftLog) Append(entries ...LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.writeLocked(entries); err != nil {
+		return err
+	}
 	if err := l.syncForAppend(); err != nil {
 		return fmt.Errorf("fsyncing log file: %w", err)
 	}
+	l.durable.Store(l.entries[len(l.entries)-1].Index)
 	return nil
 }
+
+// AppendBuffered writes entries to the file and to the in-memory log in the same
+// order Append would, but does not fsync. l.mu is held only for the write
+// syscalls. The entries are NOT durable until SyncDurable has returned nil.
+func (l *RaftLog) AppendBuffered(entries ...LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writeLocked(entries)
+}
+
+// SyncDurable fsyncs the file and then advances DurableIndex to the last index
+// that had been written before the fsync began. Calls are serialised, so there is
+// never more than one fsync in flight, and l.mu is not held during the fsync
+// (readers of the log are not blocked by it).
+func (l *RaftLog) SyncDurable() error {
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
+	l.mu.RLock()
+	target := l.entries[len(l.entries)-1].Index
+	ep := l.epoch
+	l.mu.RUnlock()
+	if err := l.syncForAppend(); err != nil {
+		return fmt.Errorf("fsyncing log file: %w", err)
+	}
+	l.mu.Lock()
+	if l.epoch == ep && target > l.durable.Load() {
+		l.durable.Store(target)
+	}
+	l.mu.Unlock()
+	return nil
+}
+
+// DurableIndex returns the highest index known to be on stable storage.
+func (l *RaftLog) DurableIndex() uint64 { return l.durable.Load() }
 
 // Get returns the entry at the given index (1-based; index 0 is the
 // sentinel and is a valid, addressable entry too).
@@ -296,6 +351,10 @@ func (l *RaftLog) TruncateFrom(index uint64) error {
 	}
 	l.entries = l.entries[:index]
 	l.offsets = l.offsets[:index]
+	l.epoch++
+	if l.durable.Load() >= index {
+		l.durable.Store(index - 1)
+	}
 	return nil
 }
 

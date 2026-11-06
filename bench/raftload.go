@@ -37,6 +37,7 @@ type LoadSpec struct {
 	Stall            map[string]StallSpec
 	EnforceDeadlines bool // network-like RPC deadlines in the in-process transport
 	SingleFlight     bool // raft.Config.SingleFlightReplication
+	AppendOutside    bool // raft.Config.AppendOutsideLock (fsync outside r.mu)
 	MaxInFlight      int  // arrivals beyond this many unfinished writes are dropped (default 20000)
 	MemLimitMB       int  // abort the run if the Go heap exceeds this (default 3000); the result is flagged MemAbort
 	Seed             int64
@@ -114,6 +115,7 @@ func RunRaftLoad(spec LoadSpec) (LoadResult, error) {
 		dirs = append(dirs, dir)
 		cfg := raft.DefaultConfig()
 		cfg.SingleFlightReplication = spec.SingleFlight
+		cfg.AppendOutsideLock = spec.AppendOutside
 		n, err := raft.NewRaftNode(id, peers, dir, transport, nullSM{}, cfg)
 		if err != nil {
 			return res, err
