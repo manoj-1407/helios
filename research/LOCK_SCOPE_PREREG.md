@@ -38,7 +38,7 @@ the mechanism is supported if, in both r100 and r120, the new arm's disrupted fr
 
 ## no-harm criteria (must all hold, else the intervention is not accepted regardless of the above)
 
-- lost acknowledged writes (`lost`) = 0 in every run of both arms.
+- safety: in every run, in both arms, with no term change (`term_end == term_start`), `lost` must be 0; and in the new arm no acknowledged index may ever hold a different entry than the one acked on any node at the end of a run (the runner's `lost` count). (see amendment 1.)
 - r050, r090 and ctl: new arm disrupted fraction not more than 10 points above baseline.
 - achieved rate and commit p99 in r050/r090 not worse than baseline by more than the paired 95% interval allows (reported, not gated, but a regression is stated).
 
@@ -55,3 +55,7 @@ commit p50/p95/p99, achieved throughput, failed proposals, peak heap and gorouti
 ## what this does not test
 
 compaction, quorum masking, the ack-semantics correctness finding (`/kv/put` acks local durable append, not commit), follower-side fsync locks, a real disk, a real network. the correctness and performance findings stay separate.
+
+## amendments
+
+1. 2026-11-06, during the primary batch, after the first 3 reps had been written and before any analysis. the no-harm line originally read "`lost` = 0 in every run of both arms". that was wrong as a criterion: when a leader is deposed, entries it acked after local durable append can be overwritten, which is the separate ack-semantics finding, and the baseline arm showed this in its 3 election runs at r100 (lost 8, 64, 39). the criterion is restated above as lost = 0 in any run without a term change, plus lost counts reported per arm. primary outcome, success criterion and cells are unchanged.
