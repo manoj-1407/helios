@@ -335,3 +335,39 @@ One 2-vCPU container; in-process transport; three Raft nodes plus the load gener
 * More benchmark expansion on this harness. The remaining open questions need either the intervention above or a real network and separate disks, not more cells.
 
 Things i would flag as unfinished: the unexplained baseline elections (3.9% of no-fault runs) and the unreproduced stage 2a transient mean the harness has a noise source i have not identified; and the stage 1 and stage 5 disagreement at rho of about 0.9.
+
+## Round 9: lock-scope intervention (pre-registered)
+
+plan, criteria and amendment: `research/LOCK_SCOPE_PREREG.md` (committed at `ae3fbdf`, before any run; amendment 1 was made after the first 3 reps and changes only the lost-ack safety line). prior art: `research/LOCK_SCOPE_PRIOR_ART.md` (no source found for this exact mechanism; mitigation direction is established in etcd/raft, NuRaft; novelty not claimed). data: `research/results/lockscope_primary.csv` (300 runs, 30 paired reps per cell, seed 11, 20 s runs, leader fsync delay 10 ms, enforced 100 ms RPC deadlines, built from `ae3fbdf`), analysis `research/results/lockscope_primary_analysis.txt` from `research/analyze_lockscope.py`. no run crashed or timed out.
+
+### intervention
+
+baseline: `Propose` holds `r.mu` and the log's mutex across the leader's fsync. new arm (`Config.AppendOutsideLock`): index, term and the log write are still chosen under `r.mu`; the fsync runs after `r.mu` and the log mutex are released, one at a time; replication and the leader's self-vote use only entries at or below the durable index; `Propose` returns only after its entry is durable and still in the log. fsync count per proposal and service capacity are unchanged. the old design could not be fixed by releasing `r.mu` alone, because the heartbeat path's `log.Get` waits on the log's own mutex, which `Append` also held across the fsync; the intervention therefore moves the fsync out of both, and the result attributes to both locks together.
+
+### primary result (term advanced during the load window = disrupted)
+
+| cell (rho) | baseline disrupted | new arm disrupted | discordant pairs | exact McNemar p |
+|---|---|---|---|---|
+| ctl (no delay) | 0/30 | 0/30 | 0 / 0 | 1 |
+| r050 (0.5) | 1/30 | 0/30 | 1 / 0 | 1 |
+| r090 (0.9) | 0/30 | 0/30 | 0 / 0 | 1 |
+| r100 (1.0) | 29/30 | 0/30 | 29 / 0 | about 2e-9 |
+| r120 (1.2) | 30/30 | 0/30 | 30 / 0 | about 2e-9 |
+
+baseline elections counted in full: 0, 3, 0, 38, 33 elections across the 30 runs of each baseline cell (ctl, r050, r090, r100, r120); new arm 0 everywhere. the one baseline disruption at r050 is the only no-fault-level event in 90 low-load baseline runs (1.1%), lower than the 3.9% seen in earlier stages; I did not explain the difference.
+
+pre-registered success criterion (at r100 and r120: at least 30 points lower and p below 0.025): met in both. no-harm: no new-arm disruption anywhere; lost acknowledged writes occurred only in baseline runs where the term changed (r050 1 run, r100 21 runs, r120 17 runs; 14, 511 and 594 entries), 0 in the new arm in all 150 runs, and 0 in any run without a term change in either arm.
+
+### what the intervention costs, and a trap in reading the latency columns
+
+paired medians per run (new minus baseline, means with 95% bootstrap intervals in the analysis file): the 3 cells below saturation are within noise on commit p50, with small p99 gains at 0.9. at rho 1.0 and 1.2 the new arm's commit p50 is much higher (median 964 ms vs 1.8 ms at 1.0, 3536 ms vs 1.5 ms at 1.2) while achieved rate is higher (+5.7 and +12.9 /s) and failed proposals are far lower (median 0 vs 60 and 167). cause, read from the data not tested separately: in the baseline arm the saturated slow leader is deposed, an undelayed node takes over and serves fast, and proposals that hit the election window fail; the baseline's good commit p50 is the post-failover healthy leader, and its bad tail is the failover. in the new arm the slow leader keeps leadership, and with offered load at or above its fsync capacity its queue grows for the whole run (offered 1.2x capacity). so removing the election removes the failover as well; it does not make an overloaded leader fast. do not read the baseline's commit p50 at saturation as a win for the original code.
+
+heartbeat-side mechanism, direct measurements (per-run maxima, paired means): leader longest `Propose` lock hold fell by 20 to 35 ms in every delayed cell (hold of about one fsync to about 0.1 ms); longest gap between consecutive sends to a peer fell by about 210 to 230 ms at rho 1.0 and 1.2 and 16 to 24 ms at 0.5 and 0.9; longest `Propose` lock wait fell by about 1.5 s and 3.1 s at 1.0 and 1.2. this is consistent with the mechanism (lock held across fsync delays the heartbeat path) and the elections vanish when it is removed.
+
+### what this does and does not show
+
+shows, for this implementation, 3 in-process nodes, injected fsync delay on the leader, 100 ms deadlines: the elections at leader utilisation 1.0 and above are caused by the fsync running inside the locks the heartbeat path needs, not by fsync latency exceeding the timeout and not by the load alone (the same load with the fsync outside the locks produced 0 elections in 60 runs). the safety checks run (race tests, ordering/durability/no-early-replication tests, 0 lost acks without a term change) found no violation. it does not show: that real disks, a real network or the other lock sites (follower `HandleAppendEntries`, vote and term persistence) behave the same; that this is novel; anything about etcd, TiKV or CockroachDB; anything about compaction. the 25 ms delay secondary replication pre-registered as secondary has not been run. stage 1 (elections near rho 0.9) and this batch (0/30 baseline at 0.9) still disagree about 0.9; this batch sides with stage 5.
+
+### findings kept separate
+
+performance/availability: leader fsync inside `r.mu` and the log mutex turns saturation into elections (this round). correctness: `/kv/put` acknowledges local durable append, not commit; acknowledged writes were lost in every baseline run that had an election (this round again), and the new arm has the same exposure if a leader is deposed for another reason. the intervention reduces how often that happens by removing the elections; it does not fix the acknowledgement semantics.

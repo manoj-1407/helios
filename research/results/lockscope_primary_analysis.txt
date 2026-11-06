@@ -1,0 +1,15 @@
+cell  pairs  disrupted_ao0  disrupted_ao1  only0 only1  mcnemar_p   elections_ao0 elections_ao1
+ctl     30     0 (   0%)     0 (   0%)     0    0     1.0000         0        0   lost_acked=0
+r050    30     1 (   3%)     0 (   0%)     1    0     1.0000         3        0   lost_acked=14
+r090    30     0 (   0%)     0 (   0%)     0    0     1.0000         0        0   lost_acked=0
+r100    30    29 (  97%)     0 (   0%)    29    0     0.0000        38        0   lost_acked=511
+r120    30    30 ( 100%)     0 (   0%)    30    0     0.0000        33        0   lost_acked=594
+
+secondary, paired difference ao1 - ao0 (mean, 95% bootstrap interval), runs where both ok
+ctl | commit_p50_ms -0.0 [-0.0,+0.0]; commit_p99_ms +0.2 [-0.1,+0.7]; achieved_per_s +0.0 [+0.0,+0.0]; failed +0.0 [+0.0,+0.0]; peak_heap_mb -0.3 [-0.5,-0.0]; peak_goroutines +0.8 [+0.1,+2.0]; L_propose_hold_max_ms -12.3 [-15.4,-9.4]; L_propose_wait_max_ms -0.8 [-1.9,-0.1]; L_sendgap_max_ms +1.6 [-0.4,+4.6]
+r050 | commit_p50_ms +0.0 [-0.0,+0.1]; commit_p99_ms +0.1 [-7.3,+7.6]; achieved_per_s +0.1 [+0.0,+0.2]; failed -0.4 [-1.3,+0.0]; peak_heap_mb +0.0 [+0.0,+0.0]; peak_goroutines -2.8 [-4.5,-1.6]; L_propose_hold_max_ms -33.7 [-46.3,-25.1]; L_propose_wait_max_ms -17.9 [-33.1,-6.6]; L_sendgap_max_ms -16.4 [-37.5,-1.6]
+r090 | commit_p50_ms -2.4 [-4.1,-0.9]; commit_p99_ms -51.0 [-91.1,-20.9]; achieved_per_s +0.0 [+0.0,+0.0]; failed +0.0 [+0.0,+0.0]; peak_heap_mb +0.0 [+0.0,+0.0]; peak_goroutines -15.7 [-23.7,-9.5]; L_propose_hold_max_ms -34.8 [-44.6,-27.0]; L_propose_wait_max_ms -51.8 [-88.6,-25.6]; L_sendgap_max_ms -23.6 [-42.2,-8.8]
+r100 | commit_p50_ms +503.6 [+253.9,+740.4]; commit_p99_ms +69.2 [-315.0,+458.4]; achieved_per_s +5.7 [+4.3,+7.2]; failed -69.2 [-83.8,-55.2]; peak_heap_mb -0.9 [-2.1,-0.0]; peak_goroutines -210.2 [-274.8,-144.8]; L_propose_hold_max_ms -22.8 [-26.1,-19.7]; L_propose_wait_max_ms -1488.5 [-1805.3,-1174.9]; L_sendgap_max_ms -211.4 [-238.1,-187.0]
+r120 | commit_p50_ms +2853.5 [+2176.8,+3406.5]; commit_p99_ms +2816.7 [+1761.4,+3822.5]; achieved_per_s +12.9 [+9.1,+16.7]; failed -199.8 [-250.1,-152.0]; peak_heap_mb -7.3 [-11.7,-3.7]; peak_goroutines -310.3 [-497.2,-135.4]; L_propose_hold_max_ms -19.8 [-23.0,-16.8]; L_propose_wait_max_ms -3134.5 [-3990.7,-2328.8]; L_sendgap_max_ms -232.0 [-258.7,-205.8]
+
+missing/failed runs: none
